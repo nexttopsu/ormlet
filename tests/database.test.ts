@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { Database, DatabaseClosedError, InvalidModelError, LockTimeoutError, SqlModelError, ValidationError } from '../src/index.js';
 
 // 传入故意非法的参数时绕过编译期检查，测试运行时校验
@@ -200,6 +201,131 @@ describe('Database', () => {
     assert.throws(() => User.delete(1), DatabaseClosedError);
     assert.throws(() => User.count(), DatabaseClosedError);
     assert.throws(() => User.search('张三'), DatabaseClosedError);
+  });
+});
+
+describe('日志模式（WAL）', () => {
+  test('文件库默认启用 WAL', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-wal-'));
+    const file = path.join(dir, 'data.db');
+    try {
+      const db = new Database(file);
+      const raw = new DatabaseSync(file);
+      const mode = raw.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
+      assert.equal(mode.journal_mode, 'wal');
+      raw.close();
+      db.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('内存库不受 journalMode 影响', () => {
+    const db = new Database(':memory:');
+    const User = db.model('User', { tableName: 'users', fields: { name: 'TEXT' } });
+    User.create({ name: '张三' });
+    assert.equal(User.count(), 1);
+    db.close();
+  });
+
+  test('journalMode: DELETE 显式退回回滚日志模式', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-delete-mode-'));
+    const file = path.join(dir, 'data.db');
+    try {
+      const db = new Database(file, { journalMode: 'DELETE' });
+      const raw = new DatabaseSync(file);
+      const mode = raw.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
+      assert.equal(mode.journal_mode, 'delete');
+      raw.close();
+      db.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('WAL 模式下另一连接的只读事务不再阻塞写入', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-wal-read-'));
+    const file = path.join(dir, 'data.db');
+    const init = new Database(file);
+    init.model('A', { tableName: 'a', fields: { name: 'TEXT' } }).create({ name: 'seed' });
+    init.close();
+
+    // 子进程开启只读事务并保持 600ms 不提交
+    const childCode = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('BEGIN');
+      db.prepare('SELECT COUNT(*) FROM a').get();
+      console.log('READING');
+      setTimeout(() => { db.exec('COMMIT'); db.close(); }, 600);
+    `;
+    const child = spawn(process.execPath, ['--no-warnings', '-e', childCode, file], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+    });
+    try {
+      await new Promise<void>((resolve) => {
+        child.stdout.on('data', (buf: Buffer) => {
+          if (buf.toString().includes('READING')) resolve();
+        });
+      });
+
+      const db = new Database(file, { busyTimeout: 0 });
+      const A = db.model('A', { tableName: 'a', fields: { name: 'TEXT' } });
+      // WAL 下写入不再被只读事务阻塞；回滚日志模式下这里会抛 LockTimeoutError
+      assert.doesNotThrow(() => A.create({ name: 'writer' }));
+      assert.ok(A.count() >= 2);
+      db.close();
+    } finally {
+      child.kill();
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // 句柄释放存在延迟，清理失败不影响测试结论
+      }
+    }
+  });
+
+  test('回滚日志模式下同一场景会被锁阻塞（对照）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-delete-read-'));
+    const file = path.join(dir, 'data.db');
+    const init = new Database(file, { journalMode: 'DELETE' });
+    init.model('A', { tableName: 'a', fields: { name: 'TEXT' } }).create({ name: 'seed' });
+    init.close();
+
+    const childCode = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('BEGIN');
+      db.prepare('SELECT COUNT(*) FROM a').get();
+      console.log('READING');
+      setTimeout(() => { db.exec('COMMIT'); db.close(); }, 600);
+    `;
+    const child = spawn(process.execPath, ['--no-warnings', '-e', childCode, file], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+    });
+    try {
+      await new Promise<void>((resolve) => {
+        child.stdout.on('data', (buf: Buffer) => {
+          if (buf.toString().includes('READING')) resolve();
+        });
+      });
+
+      const db = new Database(file, { journalMode: 'DELETE', busyTimeout: 0 });
+      const A = db.model('A', { tableName: 'a', fields: { name: 'TEXT' } });
+      assert.throws(() => A.create({ name: 'writer' }), LockTimeoutError);
+      db.close();
+    } finally {
+      child.kill();
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // 句柄释放存在延迟，清理失败不影响测试结论
+      }
+    }
   });
 });
 

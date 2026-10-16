@@ -52,7 +52,7 @@ db.close();
 | 22.13.0 – 24.14.x | 实验性，无需 flag，运行时输出 `ExperimentalWarning` | 可用 |
 | 24.15.0+ / 25.7.0+ | Release Candidate，无警告 | 可用 |
 
-> 并发写入（多进程 / 多实例访问同一文件）：本库默认设置 `PRAGMA busy_timeout = 5000`，遇到瞬时锁冲突会等待重试，可通过 `new Database(path, { busyTimeout })` 调整。默认的 rollback journal 模式下**读事务会阻塞写**（WAL 模式则不会）；若读写并发较高，建议额外在连接上执行 `PRAGMA journal_mode = WAL`，并避免把数据库文件放在网络盘或云同步盘上。
+> 并发写入（多进程 / 多实例访问同一文件）：本库默认设置 `PRAGMA busy_timeout = 5000`（瞬时锁冲突会等待重试）并默认启用 WAL 日志模式（读写互不阻塞），两者都可通过 `new Database(path, { busyTimeout, journalMode })` 调整。WAL 会额外产生 `-wal` / `-shm` 文件；数据库文件不要放在网络盘或云同步盘上，那里的文件锁不可靠。
 
 - `package.json` 中已声明 `"engines": { "node": ">=22.5.0" }`。
 - 在 22.5.0 – 22.12.x 上使用时需要启动参数：`node --experimental-sqlite app.js`。
@@ -136,9 +136,10 @@ db.close();
 打开（或创建）一个 SQLite 数据库。
 
 - `path: string` — 数据库文件路径，不存在时自动创建；传 `':memory:'` 使用内存数据库。
-- `options.busyTimeout?: number` — 遇到数据库锁（其他连接正在读写同一文件）时的等待重试时长，毫秒，默认 `5000`。超时仍拿不到锁才会抛出 `database is locked`；设为 `0` 表示不等待、立即报错。
+- `options.busyTimeout?: number` — 遇到数据库锁（其他连接正在读写同一文件）时的等待重试时长，毫秒，默认 `5000`。超时仍拿不到锁才会抛出 `LockTimeoutError`；设为 `0` 表示不等待、立即报错。等待发生在同步 API 内部，会阻塞事件循环至多该时长。
+- `options.journalMode?: 'WAL' | 'DELETE' | 'MEMORY'` — 日志模式，默认 `'WAL'`（文件库）。WAL 下写不阻塞读、读不阻塞写，显著降低 `database is locked` 概率；`'DELETE'` 是 SQLite 默认的回滚日志模式（读事务会阻塞写）；`'MEMORY'` 日志放内存，崩溃可能损坏数据库。`:memory:` 内存库忽略该选项。
 - 连接由 `Database` 实例统一持有，禁止模型各自创建连接。
-- 路径非法（非字符串或空字符串）时抛出 `ValidationError`。
+- 路径非法（非字符串或空字符串）、或 `options` 含未知键 / 取值非法时抛出 `ValidationError`。
 
 #### `db.model(name, definition)`
 

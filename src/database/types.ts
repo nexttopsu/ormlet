@@ -25,10 +25,22 @@ export type FieldValue<T extends FieldType> =
 export interface DatabaseOptions {
   /**
    * 遇到数据库锁（其他连接正在读写同一文件）时的等待重试时长，毫秒。
-   * 默认 5000：等待至多 5 秒，仍拿不到锁才抛出 "database is locked"。
+   * 默认 5000：等待至多 5 秒，仍拿不到锁才抛出 LockTimeoutError。
    * 设为 0 表示不等待、立即报错。
+   *
+   * 注意：等待发生在同步 API 内部，会阻塞事件循环至多该时长。
    */
   busyTimeout?: number;
+  /**
+   * 日志模式，决定读写并发行为。默认 `'WAL'`。
+   * - `'WAL'`：写不阻塞读、读不阻塞写，显著降低 "database is locked" 概率（推荐）；
+   * - `'DELETE'`：SQLite 默认的回滚日志模式，读事务会阻塞写，仅在特殊场景下使用；
+   * - `'MEMORY'`：日志放在内存中，崩溃可能损坏数据库，仅用于一次性临时数据。
+   *
+   * `:memory:` 内存库忽略该选项。WAL 会额外产生 `-wal` / `-shm` 文件，
+   * 且不适用于网络盘 / 云同步盘（那里文件锁不可靠）。
+   */
+  journalMode?: 'WAL' | 'DELETE' | 'MEMORY';
 }
 
 /**

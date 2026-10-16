@@ -2,6 +2,14 @@
   "name": "ormlet",
   "version": "1.0.0",
   "description": "Lightweight, type-safe SQLite data-model layer for Node.js, built on the native node:sqlite module. Zero runtime dependencies.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nexttopsu/ormlet.git"
+  },
+  "homepage": "https://github.com/nexttopsu/ormlet#readme",
+  "bugs": {
+    "url": "https://github.com/nexttopsu/ormlet/issues"
+  },
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",

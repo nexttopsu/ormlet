@@ -432,6 +432,63 @@ describe('findMany 排序与分页', () => {
   });
 });
 
+describe('错误信息不泄露 schema 标识符', () => {
+  test('CRUD 校验错误不回显模型名 / 表名 / 字段名', () => {
+    const db2 = new Database(':memory:');
+    const secret = db2.model('InternalPayroll', {
+      tableName: 'employee_salaries',
+      fields: { fullName: 'TEXT', salaryCents: 'INTEGER' },
+    });
+
+    const cases: Array<() => unknown> = [
+      () => secret.create(invalid({ unknownColumn: 'x' })),
+      () => secret.update(1, invalid({ unknownColumn: 'x' })),
+      () => secret.findMany(invalid({ unknownColumn: 'x' })),
+      () => secret.findMany(invalid({ salaryCents: '0' })),
+      () => secret.deleteField('fullName'),
+      () => secret.create(invalid({ fullName: 123 })),
+      () => secret.create({}),
+      () => secret.findMany(undefined, invalid({ orderBy: 'unknownColumn' })),
+    ];
+
+    for (const run of cases) {
+      assert.throws(run, (error: unknown) => {
+        const message = (error as Error).message;
+        for (const identifier of ['InternalPayroll', 'employee_salaries', 'fullName', 'salaryCents', 'unknownColumn']) {
+          assert.ok(
+            !message.includes(identifier),
+            `message must not contain "${identifier}", got: ${message}`,
+          );
+        }
+        return true;
+      });
+    }
+    db2.close();
+  });
+
+  test('注入尝试不会被回显到错误消息里', () => {
+    const db2 = new Database(':memory:');
+    const User = db2.model('User', { tableName: 'users', fields: { name: 'TEXT' } });
+    const payload = 'x"; DROP TABLE users; --';
+
+    assert.throws(
+      () => db2.model('M2', { tableName: payload, fields: { name: 'TEXT' } }),
+      (error: unknown) => {
+        assert.ok(!(error as Error).message.includes('DROP TABLE'));
+        return true;
+      },
+    );
+    assert.throws(
+      () => User.deleteField(payload),
+      (error: unknown) => {
+        assert.ok(!(error as Error).message.includes('DROP TABLE'));
+        return true;
+      },
+    );
+    db2.close();
+  });
+});
+
 describe('search 关键字搜索', () => {
   test('matches substrings case-insensitively across default TEXT fields', () => {
     User.create({ name: 'Zhang San', email: 'zhang@example.com' });

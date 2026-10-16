@@ -46,34 +46,34 @@ export class Model<F extends ModelFields = ModelFields> {
     assertIdentifier(name, 'model name');
     if (definition === null || typeof definition !== 'object' || Array.isArray(definition)) {
       throw new InvalidModelError(
-        `Model "${name}" definition must be an object with "tableName" and "fields", received ${describeValue(definition)}`,
+        `Model definition must be an object with "tableName" and "fields", received ${describeValue(definition)}`,
       );
     }
     const { tableName, fields } = definition;
     if (tableName === undefined || fields === undefined) {
-      throw new InvalidModelError(`Model "${name}" definition requires both "tableName" and "fields"`);
+      throw new InvalidModelError('Model definition requires both "tableName" and "fields"');
     }
-    assertIdentifier(tableName, `table name of model "${name}"`);
+    assertIdentifier(tableName, 'table name');
     if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
       throw new InvalidModelError(
-        `fields of model "${name}" must be an object mapping field names to field types, received ${describeValue(fields)}`,
+        `Model fields must be an object mapping field names to field types, received ${describeValue(fields)}`,
       );
     }
     const fieldEntries = Object.entries(fields);
     if (fieldEntries.length === 0) {
-      throw new InvalidModelError(`Model "${name}" must declare at least one field`);
+      throw new InvalidModelError('Model must declare at least one field');
     }
     for (const [fieldName, fieldType] of fieldEntries) {
-      assertIdentifier(fieldName, `field name of model "${name}"`);
+      assertIdentifier(fieldName, 'field name');
       const reserved = reservedFieldName(fieldName);
       if (reserved !== null) {
         throw new InvalidModelError(
-          `Field "${fieldName}" is reserved (${reserved} is managed automatically) and cannot be declared on model "${name}"`,
+          `A declared field is reserved: "${reserved}" is managed automatically and cannot be declared on a model`,
         );
       }
       if (typeof fieldType !== 'string' || !FIELD_TYPES.has(fieldType)) {
         throw new InvalidModelError(
-          `Invalid type for field "${fieldName}" of model "${name}": expected one of ${[...FIELD_TYPES].join(', ')}, received ${describeValue(fieldType)}`,
+          `Invalid field type: expected one of ${[...FIELD_TYPES].join(', ')}, received ${describeValue(fieldType)}`,
         );
       }
     }
@@ -113,7 +113,7 @@ export class Model<F extends ModelFields = ModelFields> {
     const id = toSafeInteger(result.lastInsertRowid);
     const row = this.selectById(id);
     if (row === undefined) {
-      throw new SqlModelError(`Inserted row (id = ${id}) could not be read back from table "${this.tableName}"`);
+      throw new SqlModelError(`Inserted row (id = ${id}) could not be read back from the table`);
     }
     return row;
   }
@@ -243,7 +243,7 @@ export class Model<F extends ModelFields = ModelFields> {
     const raw = this.execute('count()', (db) => db.prepare(sql).get(...params));
     const total = raw?.total;
     if (typeof total !== 'number' && typeof total !== 'bigint') {
-      throw new SqlModelError(`COUNT(*) on table "${this.tableName}" did not return an integer`);
+      throw new SqlModelError('COUNT(*) did not return an integer');
     }
     return toSafeInteger(total);
   }
@@ -293,7 +293,7 @@ export class Model<F extends ModelFields = ModelFields> {
     for (const declared of this.fieldTypes.keys()) {
       if (declared.toLowerCase() === lower) {
         throw new ValidationError(
-          `Field "${field}" is declared on model "${this.name}" and cannot be deleted. ` +
+          'The field is declared on the model and cannot be deleted. ' +
             'Remove it from the model definition first, then call deleteField to drop the column',
         );
       }
@@ -352,11 +352,11 @@ export class Model<F extends ModelFields = ModelFields> {
       if (type === undefined) {
         throw this.unknownFieldError(field, context);
       }
-      assertFieldValue(field, type, value);
+      assertFieldValue(type, value);
       entries.push([field, value as SQLInputValue]);
     }
     if (entries.length === 0) {
-      throw new ValidationError(`${context} on model "${this.name}" requires at least one field`);
+      throw new ValidationError(`${context} requires at least one field`);
     }
     return entries;
   }
@@ -381,10 +381,10 @@ export class Model<F extends ModelFields = ModelFields> {
       }
       if (value === null) {
         throw new ValidationError(
-          `Field "${field}" cannot be null in ${context}: SQL "column = NULL" never matches any row`,
+          `Field must be a non-null value in ${context}: SQL "column = NULL" never matches any row`,
         );
       }
-      assertFieldValue(field, type, value);
+      assertFieldValue(type, value);
       entries.push([field, value as SQLInputValue]);
     }
     return entries;
@@ -423,7 +423,7 @@ export class Model<F extends ModelFields = ModelFields> {
       const field = options.orderBy;
       if (typeof field !== 'string') {
         throw new ValidationError(
-          `findMany() options.orderBy must be a field declared on model "${this.name}", received ${describeValue(field)}`,
+          `findMany() options.orderBy must be a field declared on the model, received ${describeValue(field)}`,
         );
       }
       if (this.fieldTypes.get(field) === undefined) {
@@ -482,7 +482,7 @@ export class Model<F extends ModelFields = ModelFields> {
         .filter(([, type]) => type === 'TEXT')
         .map(([field]) => field);
       if (textFields.length === 0) {
-        throw new ValidationError(`Model "${this.name}" has no TEXT fields to search in ${context}`);
+        throw new ValidationError(`The model has no TEXT fields to search in ${context}`);
       }
       return textFields;
     }
@@ -504,11 +504,11 @@ export class Model<F extends ModelFields = ModelFields> {
       }
       if (type !== 'TEXT') {
         throw new ValidationError(
-          `Field "${field}" of model "${this.name}" is ${type}; only TEXT fields can be searched in ${context}`,
+          `The field is ${type}; only TEXT fields can be searched in ${context}`,
         );
       }
       if (seen.has(field)) {
-        throw new ValidationError(`Duplicate field "${field}" in ${context} fields`);
+        throw new ValidationError(`Duplicate field in ${context} fields`);
       }
       seen.add(field);
     }
@@ -534,14 +534,18 @@ export class Model<F extends ModelFields = ModelFields> {
     return options;
   }
 
-  private unknownFieldError(field: string, context: string): ValidationError {
-    const reserved = reservedFieldName(field);
+  /**
+   * 未知字段 / 保留字段错误。
+   * 错误消息不包含字段名或模型名，避免把数据库结构写进日志或回显给调用方。
+   */
+  private unknownFieldError(_field: string, context: string): ValidationError {
+    const reserved = reservedFieldName(_field);
     if (reserved !== null) {
       return new ValidationError(
-        `Field "${reserved}" is managed automatically and cannot be passed to ${context} of model "${this.name}"`,
+        `Field "${reserved}" is managed automatically and cannot be passed to ${context}`,
       );
     }
-    return new ValidationError(`Model "${this.name}" has no field "${field}"`);
+    return new ValidationError(`The model has no such field in ${context}`);
   }
 
   /**

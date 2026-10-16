@@ -33,14 +33,26 @@ export function describeValue(value: unknown): string {
   return String(value);
 }
 
+/**
+ * 错误信息中的标识符脱敏。
+ *
+ * 错误消息可能被日志聚合、上报或返回给终端用户，其中不应出现表名、字段名、
+ * 模型名等 schema 信息。因此错误消息只描述「哪个环节出错 + 期望什么」，
+ * 不回显调用方传入的标识符，只在需要时描述其类型（避免把注入载荷写进日志）。
+ */
+export function describeIdentifier(name: unknown): string {
+  return `a ${typeof name}`;
+}
+
 export function assertIdentifier(
   name: unknown,
   kind: string,
   errorType: new (message: string) => SqlModelError = InvalidModelError,
 ): asserts name is string {
   if (typeof name !== 'string' || !IDENTIFIER_PATTERN.test(name)) {
+    // 不回显原始输入：非法值可能是注入载荷，也可能是敏感名称
     throw new errorType(
-      `Invalid ${kind}: identifiers must match /^[A-Za-z_][A-Za-z0-9_]*$/, received ${describeValue(name)}`,
+      `Invalid ${kind}: identifiers must match /^[A-Za-z_][A-Za-z0-9_]*$/, received ${describeIdentifier(name)}`,
     );
   }
 }
@@ -67,8 +79,9 @@ export function assertId(id: unknown): number {
 /**
  * 校验字段值与声明的字段类型匹配。显式 null 允许（写入 NULL）。
  * INTEGER 额外要求安全整数，避免超出 JS 表示范围后读取报错。
+ * 错误消息不包含字段名，避免泄露数据库结构。
  */
-export function assertFieldValue(field: string, type: FieldType, value: unknown): void {
+export function assertFieldValue(type: FieldType, value: unknown): void {
   if (value === null) return;
   if (type === 'TEXT' && typeof value === 'string') return;
   if (type === 'INTEGER' && typeof value === 'number' && Number.isSafeInteger(value)) return;
@@ -81,7 +94,7 @@ export function assertFieldValue(field: string, type: FieldType, value: unknown)
     BLOB: 'a Uint8Array',
   };
   throw new ValidationError(
-    `Invalid value for field "${field}" of type ${type}: expected ${expected[type]}, received ${describeValue(value)}`,
+    `Invalid value for a field of type ${type}: expected ${expected[type]}, received ${describeValue(value)}`,
   );
 }
 

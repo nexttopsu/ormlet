@@ -60,15 +60,16 @@ export class Database {
       translateSqliteError(error, 'Opening the database');
     }
     if (journalMode !== undefined && path !== MEMORY_PATH) {
-      this.applyJournalMode(path, journalMode);
+      this.applyJournalMode(journalMode);
     }
   }
 
   /**
    * 应用日志模式。切换日志模式需要短暂的独占锁，因此**不能**让打开失败：
    * 拿不到锁时保持原有模式并发出警告，由调用方决定是否重试或改用 busyTimeout。
+   * 警告中不包含数据库路径，避免把文件系统布局写进日志。
    */
-  private applyJournalMode(path: string, journalMode: string): void {
+  private applyJournalMode(journalMode: string): void {
     try {
       const row = this.connection.prepare(`PRAGMA journal_mode = ${journalMode}`).get() as
         | { journal_mode?: string }
@@ -76,7 +77,7 @@ export class Database {
       const applied = typeof row?.journal_mode === 'string' ? row.journal_mode.toLowerCase() : undefined;
       if (applied !== undefined && applied !== journalMode.toLowerCase()) {
         emitWarning(
-          `journalMode "${journalMode}" could not be applied to ${path}; the database kept "${applied}". ` +
+          `journalMode "${journalMode}" could not be applied; the database kept "${applied}". ` +
             'This usually means another connection is holding the lock',
           'ORM_JOURNAL_MODE_NOT_APPLIED',
         );
@@ -84,7 +85,7 @@ export class Database {
     } catch (error) {
       if (!isLockConflict(error)) throw error;
       emitWarning(
-        `journalMode "${journalMode}" could not be applied to ${path} because another connection holds the lock; ` +
+        `journalMode "${journalMode}" could not be applied because another connection holds the lock; ` +
           'the database kept its previous journal mode. Reopen it when idle to enable it',
         'ORM_JOURNAL_MODE_NOT_APPLIED',
       );
@@ -147,7 +148,7 @@ export class Database {
     this.assertOpen();
     if (this.modelNames.has(name)) {
       throw new InvalidModelError(
-        `Model "${name}" is already registered on this database; model names must be unique`,
+        'A model with this name is already registered on this database; model names must be unique',
       );
     }
     // 表名占用检查必须在构造模型之前：模型构造会建表并补齐字段（ALTER TABLE），
@@ -156,7 +157,7 @@ export class Database {
       const owner = this.tableOwners.get(definition.tableName);
       if (owner !== undefined) {
         throw new InvalidModelError(
-          `Table "${definition.tableName}" is already used by model "${owner}"; each model needs its own tableName`,
+          'This tableName is already used by another model; each model needs its own tableName',
         );
       }
     }

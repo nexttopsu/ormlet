@@ -1,5 +1,5 @@
 {
-  "name": "sqlmodel",
+  "name": "ormlet",
   "version": "1.0.0",
   "description": "Lightweight, type-safe SQLite data-model layer for Node.js, built on the native node:sqlite module. Zero runtime dependencies.",
   "main": "./dist/index.cjs",

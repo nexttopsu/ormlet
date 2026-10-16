@@ -1,4 +1,4 @@
-# sqlmodel
+# ormlet
 
 基于 Node.js 内置 `node:sqlite` 模块的轻量级、类型安全的数据模型封装库。
 
@@ -6,7 +6,7 @@
 **零第三方运行时依赖**（不依赖 `sqlite3`、`better-sqlite3`、TypeORM、Prisma 等），构建产物只引用 `node:sqlite`。
 
 ```typescript
-import { Database } from 'sqlmodel';
+import { Database } from 'ormlet';
 
 const db = new Database('./data.db');
 
@@ -60,7 +60,7 @@ db.close();
 ## 安装
 
 ```bash
-npm install sqlmodel
+npm install ormlet
 ```
 
 本地开发：
@@ -75,7 +75,7 @@ npm run dev          # 运行示例 example.ts
 ## 快速开始
 
 ```typescript
-import { Database } from 'sqlmodel';
+import { Database } from 'ormlet';
 
 // ':memory:' 创建内存数据库；传文件路径则打开或自动创建文件数据库
 const db = new Database(':memory:');

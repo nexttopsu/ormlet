@@ -52,6 +52,8 @@ db.close();
 | 22.13.0 – 24.14.x | 实验性，无需 flag，运行时输出 `ExperimentalWarning` | 可用 |
 | 24.15.0+ / 25.7.0+ | Release Candidate，无警告 | 可用 |
 
+> 并发写入（多进程 / 多实例访问同一文件）：本库默认设置 `PRAGMA busy_timeout = 5000`，遇到瞬时锁冲突会等待重试，可通过 `new Database(path, { busyTimeout })` 调整。默认的 rollback journal 模式下**读事务会阻塞写**（WAL 模式则不会）；若读写并发较高，建议额外在连接上执行 `PRAGMA journal_mode = WAL`，并避免把数据库文件放在网络盘或云同步盘上。
+
 - `package.json` 中已声明 `"engines": { "node": ">=22.5.0" }`。
 - 在 22.5.0 – 22.12.x 上使用时需要启动参数：`node --experimental-sqlite app.js`。
 - 在 22.13.0+ 上运行时会在 stderr 输出一次 `ExperimentalWarning: SQLite is an experimental feature...`，属正常现象；如需静默可加 `--no-warnings`。
@@ -375,14 +377,32 @@ User.findMany({ age: '25' });        // 错误：查询条件类型不匹配
 
 ### 错误类型
 
-所有错误继承自 `SqlModelError`，均包含明确的英文错误信息（不含敏感信息）：
+所有错误继承自 `SqlModelError`，均包含明确的英文错误信息（不含表名 / 字段名 / 业务数据等敏感信息）：
 
 | 错误类 | 触发场景 |
 | --- | --- |
-| `SqlModelError` | 基类；SQLite 返回超出安全整数范围的数值等内部异常 |
+| `SqlModelError` | 基类；SQLite 返回超出安全整数范围的数值等内部异常，底层原始错误挂在 `cause` 上 |
 | `DatabaseClosedError` | 数据库关闭后继续操作 |
 | `InvalidModelError` | 模型定义非法：表名 / 字段名 / 字段类型不合法，模型名或表名重复 |
 | `ValidationError` | CRUD 参数非法：未知字段、值类型不匹配、空数据、非法 id、查询条件传 null 等 |
+| `LockTimeoutError` | 数据库被其他连接锁定，且在 `busyTimeout` 内未能取得锁（`errcode` 保留 SQLITE_BUSY / SQLITE_LOCKED） |
+
+底层 SQLite 错误不会原样冒泡：锁冲突统一抛 `LockTimeoutError`，其余包装为 `SqlModelError` 并保留 `cause`。因此可以这样区分并重试：
+
+```typescript
+import { LockTimeoutError, isLockConflict } from 'ormlet';
+
+try {
+  User.create({ name: '张三' });
+} catch (error) {
+  if (error instanceof LockTimeoutError) {
+    // 锁竞争：稍后重试，或调大 busyTimeout
+  } else if (isLockConflict(error)) {
+    // 也能识别被其他层包装过的锁错误
+  }
+  throw error;
+}
+```
 
 ## 安全设计
 

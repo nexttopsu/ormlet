@@ -16,6 +16,8 @@ export type {
 export {
   DatabaseClosedError,
   InvalidModelError,
+  LockTimeoutError,
   SqlModelError,
   ValidationError,
 } from './errors.js';
+export { isLockConflict, translateSqliteError } from './sql-error.js';

@@ -1,6 +1,7 @@
 import type { SQLOutputValue, SQLInputValue } from 'node:sqlite';
 import type { Database } from './database.js';
 import { InvalidModelError, SqlModelError, ValidationError } from './errors.js';
+import { translateSqliteError } from './sql-error.js';
 import type {
   CountOptions,
   FieldType,
@@ -108,7 +109,7 @@ export class Model<F extends ModelFields = ModelFields> {
       `INSERT INTO "${this.tableName}" ` +
       `(${entries.map(([field]) => `"${field}"`).join(', ')}) ` +
       `VALUES (${entries.map(() => '?').join(', ')})`;
-    const result = this.database.prepare(sql).run(...entryValues(entries));
+    const result = this.execute('create()', (db) => db.prepare(sql).run(...entryValues(entries)));
     const id = toSafeInteger(result.lastInsertRowid);
     const row = this.selectById(id);
     if (row === undefined) {
@@ -146,12 +147,13 @@ export class Model<F extends ModelFields = ModelFields> {
         params.push(offset);
       }
     }
-    return this.database
-      .prepare(sql)
-      .all(...params)
-      .map((raw) => this.toRow(raw));
+    return this.execute('findMany()', (db) =>
+      db
+        .prepare(sql)
+        .all(...params)
+        .map((raw) => this.toRow(raw)),
+    );
   }
-
   /**
    * 关键字搜索：对 TEXT 字段做子串匹配（`LIKE '%keyword%'`），任意字段命中即返回（OR 语义）。
    * SQLite 的 LIKE 对 ASCII 大小写不敏感；`%` 与 `_` 作为 LIKE 通配符原样生效。
@@ -176,12 +178,13 @@ export class Model<F extends ModelFields = ModelFields> {
         params.push(offset);
       }
     }
-    return this.database
-      .prepare(sql)
-      .all(...params)
-      .map((raw) => this.toRow(raw));
+    return this.execute('findMany()', (db) =>
+      db
+        .prepare(sql)
+        .all(...params)
+        .map((raw) => this.toRow(raw)),
+    );
   }
-
   /**
    * 按 id 更新指定记录，只更新传入的字段。
    * `updatedAt` 自动刷新为当前时间；返回是否有记录被修改，记录不存在时返回 false。
@@ -195,7 +198,9 @@ export class Model<F extends ModelFields = ModelFields> {
       `UPDATE "${this.tableName}" ` +
       `SET ${entries.map(([field]) => `"${field}" = ?`).join(', ')} ` +
       `WHERE "${PRIMARY_KEY}" = ?`;
-    const result = this.database.prepare(sql).run(...entryValues(entries), safeId);
+    const result = this.execute('update()', (db) =>
+      db.prepare(sql).run(...entryValues(entries), safeId),
+    );
     return toSafeInteger(result.changes) > 0;
   }
 
@@ -204,9 +209,9 @@ export class Model<F extends ModelFields = ModelFields> {
    */
   delete(id: number): boolean {
     const safeId = assertId(id);
-    const result = this.database
-      .prepare(`DELETE FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`)
-      .run(safeId);
+    const result = this.execute('delete()', (db) =>
+      db.prepare(`DELETE FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).run(safeId),
+    );
     return toSafeInteger(result.changes) > 0;
   }
 
@@ -235,7 +240,7 @@ export class Model<F extends ModelFields = ModelFields> {
     if (clauses.length > 0) {
       sql += ` WHERE ${clauses.join(' AND ')}`;
     }
-    const raw = this.database.prepare(sql).get(...params);
+    const raw = this.execute('count()', (db) => db.prepare(sql).get(...params));
     const total = raw?.total;
     if (typeof total !== 'number' && typeof total !== 'bigint') {
       throw new SqlModelError(`COUNT(*) on table "${this.tableName}" did not return an integer`);
@@ -257,13 +262,17 @@ export class Model<F extends ModelFields = ModelFields> {
     const added: string[] = [];
     for (const [field, type] of this.fieldTypes) {
       if (columns.has(field.toLowerCase())) continue;
-      this.database.exec(`ALTER TABLE "${this.tableName}" ADD COLUMN "${field}" ${type}`);
+      this.execute('syncFields()', (db) =>
+        db.exec(`ALTER TABLE "${this.tableName}" ADD COLUMN "${field}" ${type}`),
+      );
       added.push(field);
     }
     // 自动管理的时间戳列同样需要补齐（例如旧版本库或外部工具创建的表）
     for (const [field, type] of MANAGED_COLUMNS) {
       if (columns.has(field.toLowerCase())) continue;
-      this.database.exec(`ALTER TABLE "${this.tableName}" ADD COLUMN "${field}" ${type}`);
+      this.execute('syncFields()', (db) =>
+        db.exec(`ALTER TABLE "${this.tableName}" ADD COLUMN "${field}" ${type}`),
+      );
       added.push(field);
     }
     return added;
@@ -292,23 +301,39 @@ export class Model<F extends ModelFields = ModelFields> {
     if (!this.getTableColumns().some((column) => column.toLowerCase() === lower)) {
       return false;
     }
-    this.database.exec(`ALTER TABLE "${this.tableName}" DROP COLUMN "${field}"`);
+    this.execute('deleteField()', (db) =>
+      db.exec(`ALTER TABLE "${this.tableName}" DROP COLUMN "${field}"`),
+    );
     return true;
   }
 
   private selectById(id: number): ModelRow<F> | undefined {
-    const raw = this.database
-      .prepare(`SELECT * FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`)
-      .get(id);
+    const raw = this.execute('findById()', (db) =>
+      db.prepare(`SELECT * FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).get(id),
+    );
     return raw === undefined ? undefined : this.toRow(raw);
   }
 
   /** 通过 pragma_table_info 表值函数查询当前表的实际列名（表名走参数绑定）。 */
   private getTableColumns(): string[] {
-    return this.database
-      .prepare('SELECT name FROM pragma_table_info(?)')
-      .all(this.tableName)
-      .map((row) => String(row.name));
+    return this.execute('Reading table columns', (db) =>
+      db
+        .prepare('SELECT name FROM pragma_table_info(?)')
+        .all(this.tableName)
+        .map((row) => String(row.name)),
+    );
+  }
+
+  /**
+   * 在共享连接上执行一次数据库操作，并把底层 SQLite 错误收敛为本库错误类型。
+   * 语句的预编译与执行都可能因锁冲突失败，因此两者都要包在同一个 try 中。
+   */
+  private execute<T>(context: string, operation: (db: Database) => T): T {
+    try {
+      return operation(this.database);
+    } catch (error) {
+      translateSqliteError(error, context);
+    }
   }
 
   /**

@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { StatementSync } from 'node:sqlite';
 import { DatabaseClosedError, InvalidModelError, ValidationError } from './errors.js';
 import { Model } from './model.js';
+import { translateSqliteError } from './sql-error.js';
 import type { DatabaseOptions, ModelDefinition, ModelFields } from './types.js';
 import { describeValue } from './validate.js';
 
@@ -116,12 +117,20 @@ export class Database {
   /** @internal 在共享连接上预编译语句（模型内部使用） */
   prepare(sql: string): StatementSync {
     this.assertOpen();
-    return this.connection.prepare(sql);
+    try {
+      return this.connection.prepare(sql);
+    } catch (error) {
+      translateSqliteError(error, 'Preparing a statement');
+    }
   }
 
   /** @internal 在共享连接上执行 SQL（模型内部使用） */
   exec(sql: string): void {
     this.assertOpen();
-    this.connection.exec(sql);
+    try {
+      this.connection.exec(sql);
+    } catch (error) {
+      translateSqliteError(error, 'Executing a statement');
+    }
   }
 }

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { Database, DatabaseClosedError, InvalidModelError, ValidationError } from '../src/index.js';
+import { Database, DatabaseClosedError, InvalidModelError, LockTimeoutError, SqlModelError, ValidationError } from '../src/index.js';
 
 // 传入故意非法的参数时绕过编译期检查，测试运行时校验
 const invalid = (value: unknown): never => value as never;
@@ -202,3 +202,83 @@ describe('Database', () => {
     assert.throws(() => User.search('张三'), DatabaseClosedError);
   });
 });
+
+describe('锁超时错误类型', () => {
+  test('锁冲突抛出 LockTimeoutError 而不是原始 SQLite 错误', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-lock-type-'));
+    const file = path.join(dir, 'data.db');
+    const init = new Database(file);
+    init.model('A', { tableName: 'a', fields: { name: 'TEXT' } }).create({ name: 'seed' });
+    init.close();
+
+    // 子进程持写事务不放，制造必然超时
+    const childCode = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('BEGIN IMMEDIATE');
+      db.prepare("INSERT INTO a (name) VALUES ('child')").run();
+      console.log('LOCKED');
+      setTimeout(() => { db.exec('COMMIT'); db.close(); }, 800);
+    `;
+    const child = spawn(process.execPath, ['--no-warnings', '-e', childCode, file], { stdio: ['ignore', 'pipe', 'inherit'] });
+    try {
+      await new Promise<void>((resolve) => {
+        child.stdout.on('data', (buf: Buffer) => {
+          if (buf.toString().includes('LOCKED')) resolve();
+        });
+      });
+
+      // busyTimeout 设为 0，确保立即超时而不是等 5 秒
+      const db = new Database(file, { busyTimeout: 0 });
+      const A = db.model('A', { tableName: 'a', fields: { name: 'TEXT' } });
+      assert.throws(
+        () => A.create({ name: 'parent' }),
+        (error: unknown) => {
+          assert.ok(error instanceof LockTimeoutError, `expected LockTimeoutError, got ${String(error)}`);
+          assert.ok(error instanceof SqlModelError);
+          // errcode 为 SQLITE_BUSY / SQLITE_LOCKED 等
+          assert.equal(typeof error.errcode, 'number');
+          return true;
+        },
+      );
+      // 错误消息不包含表名 / 字段名
+      try {
+        A.create({ name: 'parent' });
+      } catch (error) {
+        const message = (error as Error).message;
+        assert.ok(!message.includes('INSERT INTO'), 'message should not contain SQL text');
+        assert.ok(!message.includes('"a"'), 'message should not contain the table name');
+      }
+      db.close();
+    } finally {
+      child.kill();
+      // 等子进程真正退出并释放文件句柄，否则 Windows 上删除临时目录会 EBUSY
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // 句柄释放存在延迟，清理失败不影响测试结论
+      }
+    }
+  });
+
+  test('普通 SQL 错误被包装成 SqlModelError 并保留 cause', () => {
+    const db = new Database(':memory:');
+    db.model('User', { tableName: 'users', fields: { name: 'TEXT' } });
+
+    // 通过 exec 触发一个非锁类 SQL 错误（重复建表）
+    assert.throws(
+      () => db.exec('CREATE TABLE "users" ("x" TEXT)'),
+      (error: unknown) => {
+        assert.ok(error instanceof SqlModelError);
+        assert.ok(!(error instanceof LockTimeoutError));
+        // 原始错误挂在 cause 上，便于排查
+        assert.ok((error as { cause?: unknown }).cause !== undefined);
+        return true;
+      },
+    );
+    db.close();
+  });
+});
+

@@ -8,6 +8,11 @@ tsup.config.ts
 node_modules/
 .git/
 .gitignore
+.npmignore
+
+# 本地工作区数据与临时调试脚本
+.workbuddy/
+repro-*.ts
 
 # 仅本地构建
 *.log

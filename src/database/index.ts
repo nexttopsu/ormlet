@@ -2,6 +2,7 @@ export { Database } from './database.js';
 export { Model } from './model.js';
 export type {
   CountOptions,
+  DatabaseOptions,
   FieldValue,
   FieldType,
   ModelData,

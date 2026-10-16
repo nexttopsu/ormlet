@@ -3,6 +3,7 @@ import { strict as assert } from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { Database, DatabaseClosedError, InvalidModelError, ValidationError } from '../src/index.js';
 
 // 传入故意非法的参数时绕过编译期检查，测试运行时校验
@@ -26,6 +27,47 @@ describe('Database', () => {
     assert.throws(() => new Database(''), ValidationError);
     assert.throws(() => new Database(invalid(null)), ValidationError);
     assert.throws(() => new Database(invalid(undefined)), ValidationError);
+  });
+
+  test('validates Database options', () => {
+    assert.throws(() => new Database(':memory:', invalid(null)), ValidationError);
+    assert.throws(() => new Database(':memory:', invalid([])), ValidationError);
+    assert.throws(() => new Database(':memory:', invalid({ busyTimeout: -1 })), ValidationError);
+    assert.throws(() => new Database(':memory:', invalid({ busyTimeout: 1.5 })), ValidationError);
+    assert.throws(() => new Database(':memory:', invalid({ unknown: true })), ValidationError);
+    // 边界值均可接受
+    new Database(':memory:', { busyTimeout: 0 }).close();
+    new Database(':memory:', {}).close();
+    new Database(':memory:', undefined).close();
+  });
+
+  test('waits for the lock instead of failing immediately (busy timeout)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-busy-'));
+    const file = path.join(dir, 'data.db');
+    // 子进程高频写同一文件，制造锁竞争
+    const childCode = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec("CREATE TABLE IF NOT EXISTS a (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT) STRICT");
+      const insert = db.prepare("INSERT INTO a (name) VALUES ('child')");
+      setInterval(() => insert.run(), 20);
+    `;
+    const child = spawn(process.execPath, ['-e', childCode, file], { stdio: 'ignore' });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const db = new Database(file);
+      const A = db.model('A', { tableName: 'a', fields: { name: 'TEXT' } });
+      for (let i = 0; i < 10; i++) {
+        A.create({ name: `parent-${i}` });
+      }
+      // 子进程与父进程的写入都应成功落库
+      assert.ok(A.count() >= 10);
+      db.close();
+    } finally {
+      child.kill();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('registers a model and creates its table automatically', () => {

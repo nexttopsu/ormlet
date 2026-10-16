@@ -20,6 +20,18 @@ export type FieldValue<T extends FieldType> =
         : never;
 
 /**
+ * `new Database(path, options)` 的可选配置。
+ */
+export interface DatabaseOptions {
+  /**
+   * 遇到数据库锁（其他连接正在读写同一文件）时的等待重试时长，毫秒。
+   * 默认 5000：等待至多 5 秒，仍拿不到锁才抛出 "database is locked"。
+   * 设为 0 表示不等待、立即报错。
+   */
+  busyTimeout?: number;
+}
+
+/**
  * 模型字段定义：字段名 → 字段类型。
  */
 export type ModelFields = Record<string, FieldType>;

@@ -129,11 +129,12 @@ db.close();
 
 ### `class Database`
 
-#### `new Database(path)`
+#### `new Database(path, options?)`
 
 打开（或创建）一个 SQLite 数据库。
 
 - `path: string` — 数据库文件路径，不存在时自动创建；传 `':memory:'` 使用内存数据库。
+- `options.busyTimeout?: number` — 遇到数据库锁（其他连接正在读写同一文件）时的等待重试时长，毫秒，默认 `5000`。超时仍拿不到锁才会抛出 `database is locked`；设为 `0` 表示不等待、立即报错。
 - 连接由 `Database` 实例统一持有，禁止模型各自创建连接。
 - 路径非法（非字符串或空字符串）时抛出 `ValidationError`。
 

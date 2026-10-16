@@ -1,0 +1,13 @@
+# 源码与配置（发布时只需 dist 产物）
+src/
+example.ts
+tsconfig.json
+tsup.config.ts
+
+# 开发依赖与版本控制
+node_modules/
+.git/
+.gitignore
+
+# 仅本地构建
+*.log

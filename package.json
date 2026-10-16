@@ -1,0 +1,54 @@
+{
+  "name": "sqlmodel",
+  "version": "1.0.0",
+  "description": "Lightweight, type-safe SQLite data-model layer for Node.js, built on the native node:sqlite module. Zero runtime dependencies.",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "dev": "tsx example.ts",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && node --no-warnings --import tsx --test tests/database.test.ts tests/model.test.ts tests/schema.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "sqlite",
+    "node-sqlite",
+    "sql",
+    "model",
+    "orm",
+    "database",
+    "typescript",
+    "zero-dependency"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

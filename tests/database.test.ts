@@ -329,6 +329,127 @@ describe('日志模式（WAL）', () => {
   });
 });
 
+describe('busy timeout 与同步阻塞控制', () => {
+  test('busyTimeout 可读取，默认 5000', () => {
+    const db = new Database(':memory:');
+    assert.equal(db.busyTimeout, 5000);
+    db.close();
+  });
+
+  test('setBusyTimeout 可在运行时调整并校验参数', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-bt-'));
+    const file = path.join(dir, 'data.db');
+    try {
+      const db = new Database(file);
+      assert.equal(db.busyTimeout, 5000);
+      db.setBusyTimeout(100);
+      assert.equal(db.busyTimeout, 100);
+      db.setBusyTimeout(0);
+      assert.equal(db.busyTimeout, 0);
+      assert.throws(() => db.setBusyTimeout(-1), ValidationError);
+      assert.throws(() => db.setBusyTimeout(1.5), ValidationError);
+      assert.throws(() => db.setBusyTimeout(invalid('100')), ValidationError);
+      db.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('把 busyTimeout 调到 0 可让锁冲突立即失败，不再阻塞', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-nonblocking-'));
+    const file = path.join(dir, 'data.db');
+    const init = new Database(file, { journalMode: 'DELETE' });
+    init.model('A', { tableName: 'a', fields: { name: 'TEXT' } }).create({ name: 'seed' });
+    init.close();
+
+    const childCode = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('BEGIN IMMEDIATE');
+      db.prepare("INSERT INTO a (name) VALUES ('child')").run();
+      console.log('LOCKED');
+      setTimeout(() => { db.exec('COMMIT'); db.close(); }, 800);
+    `;
+    const child = spawn(process.execPath, ['--no-warnings', '-e', childCode, file], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+    });
+    try {
+      await new Promise<void>((resolve) => {
+        child.stdout.on('data', (buf: Buffer) => {
+          if (buf.toString().includes('LOCKED')) resolve();
+        });
+      });
+
+      const db = new Database(file, { journalMode: 'DELETE' });
+      const A = db.model('A', { tableName: 'a', fields: { name: 'TEXT' } });
+
+      // isLocked() 不等待，可用来在写入前判断
+      assert.equal(db.isLocked(), true);
+      // 默认 5 秒等待在锁被持有期间会一直阻塞事件循环
+      db.setBusyTimeout(0);
+      const t0 = Date.now();
+      assert.throws(() => A.create({ name: 'parent' }), LockTimeoutError);
+      // 立返回而不是等满 5 秒
+      assert.ok(Date.now() - t0 < 1000, `expected a fast failure, took ${Date.now() - t0}ms`);
+      db.close();
+    } finally {
+      child.kill();
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // 句柄释放存在延迟，清理失败不影响测试结论
+      }
+    }
+  });
+
+  test('日志模式切换拿不到锁时只警告，不导致打开失败', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-wal-fallback-'));
+    const file = path.join(dir, 'data.db');
+    const init = new Database(file, { journalMode: 'DELETE' });
+    init.model('A', { tableName: 'a', fields: { name: 'TEXT' } }).create({ name: 'seed' });
+    init.close();
+
+    const childCode = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      const ins = db.prepare("INSERT INTO a (name) VALUES ('c')");
+      const timer = setInterval(() => ins.run(), 15);
+      console.log('WRITING');
+      setTimeout(() => { clearInterval(timer); db.close(); process.exit(0); }, 1200);
+    `;
+    const child = spawn(process.execPath, ['--no-warnings', '-e', childCode, file], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+    });
+    try {
+      await new Promise<void>((resolve) => {
+        child.stdout.on('data', (buf: Buffer) => {
+          if (buf.toString().includes('WRITING')) resolve();
+        });
+      });
+
+      // 写压下的 WAL 切换必然拿不到独占锁；打开仍应成功
+      let db!: Database;
+      assert.doesNotThrow(() => {
+        db = new Database(file);
+      });
+      const A = db.model('A', { tableName: 'a', fields: { name: 'TEXT' } });
+      assert.ok(A.count() >= 1);
+      db.close();
+    } finally {
+      child.kill();
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // 句柄释放存在延迟，清理失败不影响测试结论
+      }
+    }
+  });
+});
+
 describe('锁超时错误类型', () => {
   test('锁冲突抛出 LockTimeoutError 而不是原始 SQLite 错误', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-lock-type-'));

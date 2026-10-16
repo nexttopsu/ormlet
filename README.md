@@ -137,7 +137,7 @@ db.close();
 
 - `path: string` — 数据库文件路径，不存在时自动创建；传 `':memory:'` 使用内存数据库。
 - `options.busyTimeout?: number` — 遇到数据库锁（其他连接正在读写同一文件）时的等待重试时长，毫秒，默认 `5000`。超时仍拿不到锁才会抛出 `LockTimeoutError`；设为 `0` 表示不等待、立即报错。等待发生在同步 API 内部，会阻塞事件循环至多该时长。
-- `options.journalMode?: 'WAL' | 'DELETE' | 'MEMORY'` — 日志模式，默认 `'WAL'`（文件库）。WAL 下写不阻塞读、读不阻塞写，显著降低 `database is locked` 概率；`'DELETE'` 是 SQLite 默认的回滚日志模式（读事务会阻塞写）；`'MEMORY'` 日志放内存，崩溃可能损坏数据库。`:memory:` 内存库忽略该选项。
+- `options.journalMode?: 'WAL' | 'DELETE' | 'MEMORY'` — 日志模式，默认 `'WAL'`（文件库）。WAL 下写不阻塞读、读不阻塞写，显著降低 `database is locked` 概率；`'DELETE'` 是 SQLite 默认的回滚日志模式（读事务会阻塞写）；`'MEMORY'` 日志放内存，崩溃可能损坏数据库。`:memory:` 内存库忽略该选项。切换日志模式需要短暂的独占锁，若打开时恰好有其他连接持锁，会保持原有模式并发出 `ORM_JOURNAL_MODE_NOT_APPLIED` 警告（不会导致打开失败），空闲时重新打开即可生效。
 - 连接由 `Database` 实例统一持有，禁止模型各自创建连接。
 - 路径非法（非字符串或空字符串）、或 `options` 含未知键 / 取值非法时抛出 `ValidationError`。
 
@@ -167,6 +167,35 @@ db.close();
 #### `db.close()`
 
 关闭数据库连接。可安全重复调用；关闭后所有模型操作抛出 `DatabaseClosedError`。
+
+若关闭时存在未提交的事务，该事务会被**回滚**并发出 `ORM_CLOSE_WITH_OPEN_TRANSACTION` 警告，而不是让写入静默生效或静默丢失。
+
+#### `db.inTransaction` / `db.rollback()`
+
+- `db.inTransaction` — 是否存在未提交的事务（`BEGIN` 后尚未结束）。
+- `db.rollback()` — 回滚当前事务，没有事务时返回 `false`。
+
+#### `db.busyTimeout` / `db.setBusyTimeout(ms)` / `db.isLocked()`
+
+锁等待会发生在同步 API 内部并阻塞事件循环，这三个成员用于控制与规避该阻塞：
+
+| 成员 | 说明 |
+| --- | --- |
+| `db.busyTimeout` | 当前生效的等待时长（毫秒），可用于估算最坏阻塞时间 |
+| `db.setBusyTimeout(ms)` | 运行时调整等待窗口；设为 `0` 即「宁可立即失败也不阻塞」 |
+| `db.isLocked()` | 不等待地探测当前是否被其他连接锁定，用于写入前判断 |
+
+```typescript
+// 事件循环敏感的场景：先探测，避免盲目进入最长 busyTimeout 的同步等待
+if (!db.isLocked()) {
+  User.create({ name: '张三' });
+} else {
+  // 稍后重试，或交给队列异步处理
+}
+
+// 或者把等待窗口压到最短
+db.setBusyTimeout(0);
+```
 
 #### `db.isOpen`
 

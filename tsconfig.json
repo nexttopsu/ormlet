@@ -13,6 +13,6 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/**/*", "tests/**/*", "example.ts"],
+  "include": ["src/**/*", "tests/**/*", "scripts/**/*", "example.ts"],
   "exclude": ["node_modules", "dist"]
 }

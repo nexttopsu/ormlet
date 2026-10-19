@@ -20,6 +20,14 @@ const DEFAULT_JOURNAL_MODE = 'WAL';
 /** 内存库没有独立日志文件，journal_mode 对它是空操作。 */
 const MEMORY_PATH = ':memory:';
 
+/**
+ * 只读连接的重开次数与退避基数。
+ * 重开能解决「连接缓存了旧的库状态」，但其他进程切换日志模式的临界区仍在进行时，
+ * 新连接照样会被判只读；错开几毫秒重试即可跨过这个窗口。
+ */
+const READONLY_REOPEN_ATTEMPTS = 5;
+const READONLY_REOPEN_BACKOFF_MS = 5;
+
 const JOURNAL_MODES = new Set(['WAL', 'DELETE', 'MEMORY']);
 
 /**
@@ -410,6 +418,22 @@ export class Database {
     }
   }
 
+  /**
+   * @internal 连接被 SQLite 判为只读时，关闭并重开连接以恢复写能力。
+   *
+   * 触发场景：多个进程同时初始化一个刚创建的空库，其中一个进程正在写文件头 / 切换 WAL，
+   * 其他进程的连接会缓存到「库为空」的旧状态并持续拒绝写入（SQLITE_READONLY 不受 busy
+   * handler 处理，同一连接上重试语句无效）。重开连接即可拿到最新的库状态。
+   *
+   * 重开之后仍然「可能」不可写：其他进程此时可能正处于切换日志模式的临界区，
+   * 新连接照样会被判只读。因此这里不只重开一次，而是重开后**实际探测一次写能力**
+   * （开启并回滚一个 IMMEDIATE 事务），不可写就短暂让出 CPU 后再重开，
+   * 直到可写或次数用尽。探测本身不写数据，不会留下副作用。
+   *
+   * 存在未提交事务时不做重开（否则会静默丢弃事务），返回 false 交由调用方按原错误处理。
+   * 日志模式是数据库文件级的持久属性，重开后沿用；连接上也没有长期存活的语句对象，
+   * 因此重开不会破坏调用方状态。
+   */
   reopenAfterReadOnly(): boolean {
     if (this.closed) return false;
     try {
@@ -417,13 +441,49 @@ export class Database {
     } catch {
       return false;
     }
-    try {
-      this.connection.close();
-    } catch {
-      // 连接可能已不可用；关闭失败不应阻止重开
+
+    for (let attempt = 0; attempt < READONLY_REOPEN_ATTEMPTS; attempt++) {
+      if (attempt > 0) this.sleepSync(READONLY_REOPEN_BACKOFF_MS * attempt);
+      try {
+        this.connection.close();
+      } catch {
+        // 连接可能已不可用；关闭失败不应阻止重开
+      }
+      try {
+        this.connection = new DatabaseSync(this.path);
+        this.connection.exec(`PRAGMA busy_timeout = ${this.resolvedBusyTimeout}`);
+      } catch {
+        // 重开本身失败（例如路径被移除）：留给调用方按原错误抛出
+        continue;
+      }
+      if (this.canWriteNow()) return true;
     }
-    this.connection = new DatabaseSync(this.path);
-    this.connection.exec(`PRAGMA busy_timeout = ${this.resolvedBusyTimeout}`);
+    return false;
+  }
+
+  /** 探测当前连接是否具备写能力：开启并回滚一个 IMMEDIATE 事务，不产生任何写入。 */
+  private canWriteNow(): boolean {
+    try {
+      this.connection.exec('BEGIN IMMEDIATE');
+    } catch (error) {
+      // 被别的连接占用 → 不是只读问题，交回调用方按锁冲突处理
+      return !isReadOnlyDatabaseError(error) && isLockConflict(error);
+    }
+    try {
+      this.connection.exec('ROLLBACK');
+    } catch {
+      // 回滚失败说明连接已不可用，按不可写处理
+      return false;
+    }
     return true;
+  }
+
+  /**
+   * 让出 CPU 一小段时间而不触碰事件循环：重开连接的窗口通常只有几毫秒，
+   * 用 Atomics.wait 做同步退避，保证同步 API 的语义不被改成异步。
+   */
+  private sleepSync(milliseconds: number): void {
+    const shared = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(shared, 0, 0, milliseconds);
   }
 }

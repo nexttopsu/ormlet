@@ -53,6 +53,8 @@ db.close();
 | 24.15.0+ / 25.7.0+ | Release Candidate，无警告 | 可用 |
 
 > 并发写入（多进程 / 多实例访问同一文件）：本库默认设置 `PRAGMA busy_timeout = 5000`（瞬时锁冲突会等待重试）并默认启用 WAL 日志模式（读写互不阻塞），两者都可通过 `new Database(path, { busyTimeout, journalMode })` 调整。WAL 会额外产生 `-wal` / `-shm` 文件；数据库文件不要放在网络盘或云同步盘上，那里的文件锁不可靠。
+>
+> 多实例同时首次打开一个**刚创建的空库**时，SQLite 可能把某个连接判为只读（`attempt to write a readonly database`，重试语句无效）。本库会识别该状态并自动重开一次连接恢复写入，因此并发首次启动不会出现部分实例建表失败。
 
 - `package.json` 中已声明 `"engines": { "node": ">=22.5.0" }`。
 - 在 22.5.0 – 22.12.x 上使用时需要启动参数：`node --experimental-sqlite app.js`。

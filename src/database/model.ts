@@ -1,7 +1,7 @@
 import type { SQLOutputValue, SQLInputValue } from 'node:sqlite';
 import type { Database } from './database.js';
 import { InvalidModelError, SqlModelError, ValidationError } from './errors.js';
-import { translateSqliteError } from './sql-error.js';
+import { translateSqliteError, isReadOnlyDatabaseError } from './sql-error.js';
 import type {
   CountOptions,
   FieldType,
@@ -327,11 +327,21 @@ export class Model<F extends ModelFields = ModelFields> {
   /**
    * 在共享连接上执行一次数据库操作，并把底层 SQLite 错误收敛为本库错误类型。
    * 语句的预编译与执行都可能因锁冲突失败，因此两者都要包在同一个 try 中。
+   *
+   * 另一个需要重试的情况是连接被并发首次初始化判为只读（SQLITE_READONLY，errcode 8）：
+   * 这种状态重试语句无效，必须先重开连接；写入在只读失败时没有产生副作用，重放是安全的。
    */
   private execute<T>(context: string, operation: (db: Database) => T): T {
     try {
       return operation(this.database);
     } catch (error) {
+      if (isReadOnlyDatabaseError(error) && this.database.reopenAfterReadOnly()) {
+        try {
+          return operation(this.database);
+        } catch (retryError) {
+          translateSqliteError(retryError, context);
+        }
+      }
       translateSqliteError(error, context);
     }
   }

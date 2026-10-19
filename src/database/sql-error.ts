@@ -33,6 +33,22 @@ export function isLockConflict(error: unknown): boolean {
 }
 
 /**
+ * 判断是否是「连接被 SQLite 判为只读」的错误（SQLITE_READONLY，errcode 8）。
+ *
+ * 典型来源：多个进程同时打开一个刚创建的空数据库文件，其中一个进程正在切换 WAL /
+ * 写入文件头，另一个进程的连接会缓存到「库还是空的」这一状态，此后所有写入都报
+ * "attempt to write a readonly database"，且重试无效（busy handler 不处理该错误码）。
+ * 唯一的恢复方式是关闭并重新打开连接，因此由 Database 层识别后重开一次。
+ */
+export function isReadOnlyDatabaseError(error: unknown): boolean {
+  const like = asSqliteErrorLike(error);
+  if (like === undefined) return false;
+  if (like.errcode === 8) return true;
+  const text = typeof like.errstr === 'string' ? like.errstr : typeof like.message === 'string' ? like.message : '';
+  return /attempt to write a readonly database/i.test(text);
+}
+
+/**
  * 把底层 SQLite 错误收敛为本库的错误类型：
  * - 锁冲突 → LockTimeoutError（可区分、可重试）；
  * - 其他 SQLite 错误 → SqlModelError，并保留原始错误作为 `cause`，方便排查。

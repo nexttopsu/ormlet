@@ -159,9 +159,9 @@ describe('Database', () => {
     assert.equal(post1.id, 1);
     assert.equal(post2.id, 2);
 
-    assert.equal(Post.update(post1.id, { views: 11 }), true);
+    assert.deepEqual(Post.update(post1.id, { views: 11 })?.views, 11);
     assert.equal(Post.findMany({ views: 11 }).length, 1);
-    assert.equal(User.delete(user.id), true);
+    assert.equal(User.delete(user.id)?.name, '张三');
     db.close();
   });
 

@@ -71,11 +71,25 @@ export function reservedFieldName(name: string): string | null {
 
 /**
  * 是否为自动管理的列（id / createdAt / updatedAt）。
- * 与 `reservedFieldName` 的区别：这里只回答「是不是托管列」，不做名称规范化，
- * 用于允许这些列出现在 `select` / `orderBy` 这类**只读**位置。
+ * 与 `reservedFieldName` 的区别：这里只回答「是不是托管列」，不做名称规范化。
+ *
+ * 托管列在**只读**位置（`where` / `orderBy` / `select`）与模型声明的字段一视同仁，
+ * 只有写入路径（`create` / `update` 的 data、`upsert().on`）才拒绝它们。
  */
 export function isManagedColumn(name: string): boolean {
   return reservedFieldName(name) !== null;
+}
+
+/**
+ * 托管列的存储类型。
+ *
+ * 主键是 INTEGER，两个时间戳是 TEXT（ISO 8601），因此值校验可以直接复用
+ * `assertFieldValue`，不需要为托管列单独写一套规则。
+ */
+export function managedColumnType(name: string): FieldType | undefined {
+  const canonical = reservedFieldName(name);
+  if (canonical === null) return undefined;
+  return canonical === PRIMARY_KEY ? 'INTEGER' : 'TEXT';
 }
 
 export function assertId(id: unknown): number {
@@ -83,6 +97,38 @@ export function assertId(id: unknown): number {
     throw new ValidationError(`id must be a positive safe integer, received ${describeValue(id)}`);
   }
   return id;
+}
+
+/**
+ * 校验作为**等值条件**出现在查询里的 id：必须与 `findById` 一致地是正安全整数。
+ * 自增主键从 1 开始，`{ id: 0 }` 永远不可能命中，静默返回空数组容易掩盖真正的 bug。
+ */
+export function assertConditionId(value: unknown): void {
+  assertId(value);
+}
+
+/** 批量 id 列表的上限，超过时应改用分批处理或临时表。 */
+export const MAX_ID_LIST = 10_000;
+
+/**
+ * 校验 `findByIds` 的 id 列表：必须是数组，每个元素都是合法的正安全整数。
+ * 空数组直接返回空数组（不做任何查询），与 `findMany` 的「无结果」语义一致。
+ */
+export function assertIdList(ids: unknown): number[] {
+  if (!Array.isArray(ids)) {
+    throw new ValidationError(`findByIds() expects an array of ids, received ${describeValue(ids)}`);
+  }
+  if (ids.length > MAX_ID_LIST) {
+    throw new ValidationError(
+      `findByIds() accepts at most ${MAX_ID_LIST} ids per call, received ${ids.length}`,
+    );
+  }
+  for (const id of ids) {
+    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id < 1) {
+      throw new ValidationError(`id must be a positive safe integer, received ${describeValue(id)}`);
+    }
+  }
+  return ids as number[];
 }
 
 /**

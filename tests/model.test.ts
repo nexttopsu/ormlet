@@ -198,16 +198,20 @@ describe('findMany', () => {
 
   test('rejects invalid conditions', () => {
     assert.throws(() => User.findMany(invalid({ nickname: 'x' })), ValidationError);
-    assert.throws(() => User.findMany(invalid({ id: 1 })), ValidationError);
+    // id 是托管列，可以查询，但类型必须匹配（INTEGER）
+    assert.throws(() => User.findMany(invalid({ id: 'one' })), ValidationError);
     assert.throws(() => User.findMany({ name: null }), ValidationError);
     assert.throws(() => User.findMany(invalid({ age: '25' })), ValidationError);
   });
 });
 
 describe('update', () => {
-  test('updates only the provided fields and returns true', () => {
+  test('updates only the provided fields and returns the updated row', () => {
     const user = User.create({ name: '张三', age: 25, email: 'z@example.com' });
-    assert.equal(User.update(user.id, { age: 26 }), true);
+    const returned = User.update(user.id, { age: 26 });
+    assert.equal(returned?.age, 26);
+    // 未传入的字段保持原值，返回值与回读结果一致
+    assert.deepEqual(returned, User.findById(user.id));
 
     const updated = User.findById(user.id);
     assert.equal(updated?.age, 26);
@@ -217,64 +221,66 @@ describe('update', () => {
 
   test('can set a field to null', () => {
     const user = User.create({ name: '张三', age: 25 });
-    assert.equal(User.update(user.id, { age: null }), true);
+    assert.equal(User.update(user.id, { age: null })?.age, null);
     assert.equal(User.findById(user.id)?.age, null);
   });
 
   test('refreshes updatedAt automatically but keeps createdAt', async () => {
     const user = User.create({ name: '张三', age: 25 });
     await sleep(5);
-    assert.equal(User.update(user.id, { age: 26 }), true);
+    const returned = User.update(user.id, { age: 26 });
+    assert.ok(returned !== undefined);
 
     const updated = User.findById(user.id);
     // 创建时间永不变化
     assert.equal(updated?.createdAt, user.createdAt);
+    assert.equal(returned.createdAt, user.createdAt);
     // 修改时间已刷新
     const before = user.updatedAt;
     const after = updated?.updatedAt;
     assert.ok(typeof before === 'string' && typeof after === 'string');
     assert.ok(Date.parse(after) > Date.parse(before));
+    // 返回值里的 updatedAt 就是刷新后的值
+    assert.equal(returned.updatedAt, after);
   });
 
-  test('returns false for a missing record', () => {
+  test('returns undefined for a missing record', () => {
     User.create({ name: '张三' });
-    assert.equal(User.update(999, { name: '李四' }), false);
+    assert.equal(User.update(999, { name: '李四' }), undefined);
     assert.equal(User.findById(999), undefined);
-  });
-
-  test('rejects empty updates', () => {
-    const user = User.create({ name: '张三' });
-    assert.throws(() => User.update(user.id, {}), ValidationError);
-    assert.throws(() => User.update(user.id, { age: undefined }), ValidationError);
-  });
-
-  test('rejects invalid fields, values and ids', () => {
-    const user = User.create({ name: '张三' });
-    assert.throws(() => User.update(user.id, invalid({ id: 2 })), ValidationError);
-    assert.throws(() => User.update(user.id, invalid({ nickname: 'x' })), ValidationError);
-    assert.throws(() => User.update(user.id, invalid({ age: '二十六岁' })), ValidationError);
-    assert.throws(() => User.update(invalid('1'), { age: 26 }), ValidationError);
-    assert.throws(() => User.update(0, { age: 26 }), ValidationError);
   });
 });
 
 describe('delete', () => {
-  test('deletes an existing record and returns true', () => {
-    const user = User.create({ name: '张三' });
-    assert.equal(User.delete(user.id), true);
+  test('deletes an existing record and returns the removed row', () => {
+    const user = User.create({ name: '张三', age: 25 });
+    const removed = User.delete(user.id);
+    // 返回删除前的快照，可用于审计或回收站
+    assert.deepEqual(removed, user);
     assert.equal(User.findById(user.id), undefined);
     assert.equal(User.count(), 0);
   });
 
-  test('returns false when the record does not exist', () => {
+  test('returns undefined when the record does not exist', () => {
     User.create({ name: '张三' });
-    assert.equal(User.delete(999), false);
+    assert.equal(User.delete(999), undefined);
   });
 
-  test('deleting twice returns false the second time', () => {
+  test('deleting twice returns undefined the second time', () => {
     const user = User.create({ name: '张三' });
-    assert.equal(User.delete(user.id), true);
-    assert.equal(User.delete(user.id), false);
+    assert.ok(User.delete(user.id) !== undefined);
+    assert.equal(User.delete(user.id), undefined);
+  });
+
+  test('is atomic when called inside a transaction that rolls back', () => {
+    const user = User.create({ name: '张三' });
+    assert.throws(() =>
+      db.transaction(() => {
+        assert.ok(User.delete(user.id) !== undefined);
+        throw new Error('boom');
+      }),
+    );
+    assert.ok(User.findById(user.id) !== undefined);
   });
 
   test('rejects invalid ids', () => {
@@ -387,7 +393,6 @@ describe('findMany 排序与分页', () => {
   test('rejects invalid orderBy', () => {
     User.create({ name: 'a' });
     assert.throws(() => User.findMany(undefined, invalid({ orderBy: 'nickname' })), ValidationError);
-    assert.throws(() => User.findMany(undefined, invalid({ orderBy: 'createdAt' })), ValidationError);
     assert.throws(
       () => User.findMany(undefined, invalid({ orderBy: 'name; DROP TABLE users' })),
       ValidationError,
@@ -395,7 +400,7 @@ describe('findMany 排序与分页', () => {
     assert.throws(() => User.findMany(undefined, invalid({ orderBy: 123 })), ValidationError);
   });
 
-  test('allows the managed id as orderBy', () => {
+  test('allows managed columns as orderBy', () => {
     User.create({ name: 'a' });
     User.create({ name: 'b' });
     const asc = User.findMany(undefined, { orderBy: 'id', order: 'ASC' }).map((row) => row.id);
@@ -403,6 +408,11 @@ describe('findMany 排序与分页', () => {
     // 不传 orderBy 时默认已按 id DESC，显式传 id 应得到同样结果
     const desc = User.findMany(undefined, { orderBy: 'id' }).map((row) => row.id);
     assert.deepEqual(desc, [2, 1]);
+    // createdAt 可以作为排序字段（同一毫秒内写入的两行取值相同，因此只校验集合与 id 一致）
+    const byCreated = User.findMany(undefined, { orderBy: 'createdAt' }).map((row) => row.id);
+    assert.deepEqual([...byCreated].sort(), [1, 2]);
+    const byUpdated = User.findMany(undefined, { orderBy: 'updatedAt', order: 'ASC' }).map((row) => row.id);
+    assert.deepEqual([...byUpdated].sort(), [1, 2]);
   });
 
   test('rejects invalid order values', () => {

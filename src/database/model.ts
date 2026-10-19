@@ -6,6 +6,7 @@ import type {
   CountOptions,
   CreateManyOptions,
   Cursor,
+  DeleteManyOptions,
   FieldType,
   ModelData,
   ModelDataTuple,
@@ -33,11 +34,12 @@ import {
   assertChunkSize,
   assertFieldValue,
   assertId,
+  assertConditionId,
+  assertIdList,
   assertIdentifier,
-  assertTimestampValue,
   describeValue,
   isManagedColumn,
-  isTimestampField,
+  managedColumnType,
   reservedFieldName,
   toSafeInteger,
   type DataEntry,
@@ -226,6 +228,96 @@ export class Model<F extends ModelFields = ModelFields> {
         .map((raw) => this.toRow(raw)),
     );
   }
+
+  /**
+   * 查询单条记录，没有匹配时返回 `undefined`。
+   * 等价于 `findMany(where, { ...options, limit: 1 })[0]`，但少一次数组分配，
+   * 且内部用 `LIMIT 1` 让 SQLite 找到第一行即可停止扫描。
+   *
+   * 不传 `orderBy` 时按 `id DESC` 取最新的一条（与 `findMany` 的默认一致）；
+   * 需要「最早的一条」请显式传 `{ order: 'ASC' }`。
+   * 匹配到多行时不会报错，只返回排序后的第一行。
+   *
+   * @example
+   * const user = User.findOne({ email: 'a@example.com' });
+   */
+  findOne(
+    where?: WhereInput<F>,
+    options?: Omit<QueryOptions<F>, 'limit' | 'offset'> & { select?: undefined },
+  ): ModelRow<F> | undefined;
+  findOne<K extends SelectableName<F>>(
+    where: WhereInput<F> | undefined,
+    options: Omit<QueryOptions<F>, 'limit' | 'offset'> & { select: readonly K[] },
+  ): SelectedRow<F, K> | undefined;
+  findOne(
+    where?: WhereInput<F>,
+    options?: Omit<QueryOptions<F>, 'limit' | 'offset'>,
+  ): ModelRow<F> | Record<string, SQLOutputValue> | undefined {
+    const conditions = this.validateWhere(where, 'findOne()');
+    // limit 不在 allowed 里：findOne 的语义决定了它恒为 1，允许传入只会让人以为能取第 N 条
+    const { orderBy, order } = this.validateOptions(options, 'findOne()');
+    const columns = this.projection(options?.select, 'findOne()');
+    const params = conditionParams(conditions);
+    let sql = `SELECT ${columns} FROM "${this.tableName}"`;
+    if (conditions.length > 0) sql += ` WHERE ${conditions.map((c) => c.sql).join(' AND ')}`;
+    sql += ` ORDER BY "${orderBy}" ${order} LIMIT 1`;
+    const raw = this.execute('findOne()', (db) => db.prepare(sql).get(...params));
+    return raw === undefined ? undefined : this.toRow(raw);
+  }
+
+  /**
+   * 判断是否存在匹配的记录（`SELECT 1 ... LIMIT 1`）。
+   *
+   * 只回答「有没有」，不读整行、不做 `COUNT(*)` 全表扫描——注册前查重、外键存在性
+   * 检查这类只需要布尔结果的场景应优先用它，而不是 `count(...) > 0`。
+   *
+   * @example
+   * if (User.exists({ email })) throw new Error('already registered');
+   */
+  exists(where?: WhereInput<F>): boolean {
+    const conditions = this.validateWhere(where, 'exists()');
+    const params = conditionParams(conditions);
+    let sql = `SELECT 1 AS found FROM "${this.tableName}"`;
+    if (conditions.length > 0) sql += ` WHERE ${conditions.map((c) => c.sql).join(' AND ')}`;
+    sql += ' LIMIT 1';
+    const raw = this.execute('exists()', (db) => db.prepare(sql).get(...params));
+    return raw !== undefined;
+  }
+
+  /**
+   * 按主键批量查询，返回与 `ids` 顺序一致的结果数组；不存在的 id 对应 `undefined`。
+   *
+   * - 一次查询取回全部行（`WHERE id IN (...)`），替代 `ids.map(findById)` 的 N 次往返；
+   * - **结果长度恒等于 `ids.length`**，`rows[i]` 与 `ids[i]` 一一对应，不需要再按 id 建索引；
+   *   不需要对齐时用 `filter(Boolean)`，或改用 `findMany({ id: { in: ids } })`；
+   * - 重复的 id 会返回重复的行（同样保持位置对应）；
+   * - 空数组直接返回 `[]`，不执行任何查询。
+   *
+   * @example
+   * const rows = User.findByIds([3, 1, 2]);   // rows[i] 对应 ids[i]
+   */
+  findByIds(ids: readonly number[]): Array<ModelRow<F> | undefined> {
+    assertIdList(ids);
+    if (ids.length === 0) return [];
+    const unique = [...new Set(ids)];
+    const byId = new Map<number, ModelRow<F>>();
+    const columns = this.projection(undefined, 'findByIds()');
+    for (let start = 0; start < unique.length; start += MAX_IN_ITEMS) {
+      const batch = unique.slice(start, start + MAX_IN_ITEMS);
+      const sql =
+        `SELECT ${columns} FROM "${this.tableName}" ` +
+        `WHERE "${PRIMARY_KEY}" IN (${batch.map(() => '?').join(', ')})`;
+      const rows = this.execute('findByIds()', (db) =>
+        db
+          .prepare(sql)
+          .all(...batch)
+          .map((raw) => this.toRow(raw)),
+      );
+      for (const row of rows) byId.set(row.id, row);
+    }
+    return ids.map((id) => byId.get(id));
+  }
+
   /**
    * 游标（keyset）分页：按 `(orderBy, id)` 定位起点，而不是用 `OFFSET` 跳过前 N 行。
    *
@@ -340,9 +432,17 @@ export class Model<F extends ModelFields = ModelFields> {
   }
   /**
    * 按 id 更新指定记录，只更新传入的字段。
-   * `updatedAt` 自动刷新为当前时间；返回是否有记录被修改，记录不存在时返回 false。
+   * `updatedAt` 自动刷新为当前时间。
+   *
+   * 返回**更新后的整行**；记录不存在时返回 `undefined`
+   * （旧版本返回 boolean，`if (User.update(...))` 这种写法对行对象依然成立）。
+   * 回读与写入在同一个事务中完成，不会读到并发写入的中间状态。
+   *
+   * @example
+   * const updated = User.update(id, { age: 31 });
+   * if (updated === undefined) notFound();
    */
-  update(id: number, data: ModelData<F>): boolean {
+  update(id: number, data: ModelData<F>): ModelRow<F> | undefined {
     const safeId = assertId(id);
     const entries = this.validateEntries(data, 'update()');
     // 修改时间自动刷新
@@ -351,21 +451,36 @@ export class Model<F extends ModelFields = ModelFields> {
       `UPDATE "${this.tableName}" ` +
       `SET ${entries.map(([field]) => `"${field}" = ?`).join(', ')} ` +
       `WHERE "${PRIMARY_KEY}" = ?`;
-    const result = this.execute('update()', (db) =>
-      db.prepare(sql).run(...entryValues(entries), safeId),
-    );
-    return toSafeInteger(result.changes) > 0;
+    return this.runInTransaction(() => {
+      const result = this.execute('update()', (db) =>
+        db.prepare(sql).run(...entryValues(entries), safeId),
+      );
+      if (toSafeInteger(result.changes) === 0) return undefined;
+      return this.selectById(safeId) as ModelRow<F> | undefined;
+    });
   }
 
   /**
-   * 按 id 删除一条记录，返回是否有记录被删除。
+   * 按 id 删除一条记录。
+   *
+   * 返回**被删除的那一行**（删除前的快照，可用于审计 / 回收站）；
+   * 记录不存在时返回 `undefined`。
+   * 先读后删，两步在同一个事务中完成。
+   *
+   * @example
+   * const removed = User.delete(id);
+   * if (removed !== undefined) audit.log('deleted', removed);
    */
-  delete(id: number): boolean {
+  delete(id: number): ModelRow<F> | undefined {
     const safeId = assertId(id);
-    const result = this.execute('delete()', (db) =>
-      db.prepare(`DELETE FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).run(safeId),
-    );
-    return toSafeInteger(result.changes) > 0;
+    return this.runInTransaction(() => {
+      const row = this.selectById(safeId) as ModelRow<F> | undefined;
+      if (row === undefined) return undefined;
+      this.execute('delete()', (db) =>
+        db.prepare(`DELETE FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).run(safeId),
+      );
+      return row;
+    });
   }
 
   /**
@@ -663,13 +778,43 @@ export class Model<F extends ModelFields = ModelFields> {
    * 按条件批量删除，返回受影响的行数与执行的语句数。
    *
    * - 条件与 `findMany` 完全一致；
-   * - 不传条件会删除整张表的所有行（与 `findMany()` 不传条件返回全部行对称），
-   *   因此调用方需要自己确认范围；这里不做额外的「必须带条件」限制；
+   * - **不传条件会直接抛错**：`deleteMany()` 与 `deleteMany({})` 都被拒绝。
+   *   读取（`findMany()` 返回全表）与删除（清空全表）的代价完全不对称，
+   *   一次误调用就是不可恢复的数据丢失，因此清空必须显式声明意图；
+   *   确实要清空时用 `clear()`，或传 `{ confirm: 'all' }`；
    * - 内部按 `chunkSize` 分批，整体在一个事务中执行。
    */
-  deleteMany(where?: WhereInput<F>, options?: UpdateManyOptions): MutationResult {
+  deleteMany(where: WhereInput<F>, options?: DeleteManyOptions): MutationResult {
+    return this.deleteManyInternal(where, options);
+  }
+
+  /**
+   * 清空整张表，等价于 `DELETE FROM table`（不重置自增序列）。
+   * 单独成方法是为了让「删全部」在调用处一眼可见，不必依赖阅读条件参数。
+   */
+  clear(options?: UpdateManyOptions): MutationResult {
+    return this.deleteManyInternal(undefined, { ...options, confirm: 'all' });
+  }
+
+  private deleteManyInternal(
+    where: WhereInput<F> | undefined,
+    options: DeleteManyOptions | undefined,
+  ): MutationResult {
+    const confirmed = options?.confirm === 'all';
+    if (where === undefined || (typeof where === 'object' && where !== null && Object.keys(where).length === 0)) {
+      if (!confirmed) {
+        throw new ValidationError(
+          'deleteMany() requires a non-empty where condition; use clear() to delete every row in the table',
+        );
+      }
+    }
+    if (options?.confirm !== undefined && options.confirm !== 'all') {
+      throw new ValidationError(
+        `deleteMany() options.confirm must be "all", received ${describeValue(options.confirm)}`,
+      );
+    }
     const conditions = this.validateWhere(where, 'deleteMany()');
-    const { chunkSize } = this.validateUpdateManyOptions(options);
+    const { chunkSize } = this.validateUpdateManyOptions(options, ['confirm']);
     const whereSql = conditions.length > 0 ? conditions.map((c) => c.sql).join(' AND ') : '1 = 1';
     const whereParams = conditionParams(conditions);
     let changes = 0;
@@ -873,7 +1018,8 @@ export class Model<F extends ModelFields = ModelFields> {
   /**
    * 校验查询条件并解析为 SQL 片段。
    *
-   * - 字段必须在模型白名单内；`createdAt` / `updatedAt` 只读，但允许作为条件；
+   * - 字段必须是模型声明的字段或托管列（`id` / `createdAt` / `updatedAt`）；
+   *   托管列只读，但可以自由作为查询条件（这是刻意与写入路径区分开的）；
    * - 值可以是标量（等价 `eq`）或操作符对象，操作符必须是白名单内的已知键；
    * - `null` 仍然直接拒绝（`column = NULL` 永远不成立），需要判空请用 `{ isNull: true }`；
    * - 空操作符对象 `{}` 视为错误，避免「什么都没筛」却看起来筛过。
@@ -888,9 +1034,10 @@ export class Model<F extends ModelFields = ModelFields> {
     const conditions: TupleCondition[] = [];
     for (const [field, condition] of Object.entries(where)) {
       if (condition === undefined) continue;
-      const timestamp = isTimestampField(field);
-      const type = this.fieldTypes.get(field);
-      if (!timestamp && type === undefined) {
+      // 托管列（id / createdAt / updatedAt）与模型字段一视同仁地可查：
+      // 按主键批量取行、按创建时间筛范围都是最常见的查询，没有理由拒绝。
+      const type = this.columnType(field);
+      if (type === undefined) {
         throw this.unknownFieldError(field, context);
       }
       // 只接受普通对象作为操作符容器（Uint8Array 是 BLOB 值，不是条件对象）
@@ -906,7 +1053,9 @@ export class Model<F extends ModelFields = ModelFields> {
               'Use { isNull: true } to match NULL values',
           );
         }
-        this.assertConditionValue(field, type, condition, timestamp, `${context} conditions`);
+        this.assertConditionValue(field, type, condition, `${context} conditions`);
+        // 主键的等值条件额外要求正安全整数：{ id: 0 } 永远不可能命中，静默返回空数组会掩盖 bug
+        if (field === PRIMARY_KEY) assertConditionId(condition);
         conditions.push({ field, sql: `"${field}" = ?`, params: [condition as SQLInputValue] });
         continue;
       }
@@ -925,7 +1074,7 @@ export class Model<F extends ModelFields = ModelFields> {
         }
         parts.push({
           field,
-          ...this.buildOperator(field, type, operator, value, timestamp, `${context} conditions`),
+          ...this.buildOperator(field, type, operator, value, `${context} conditions`),
         });
       }
       // 同一字段的多个操作符之间是 AND（如 { gte: 18, lt: 60 }）
@@ -945,10 +1094,9 @@ export class Model<F extends ModelFields = ModelFields> {
   /** 把单个操作符解析为 SQL 片段。校验失败时抛出 ValidationError（不含字段名）。 */
   private buildOperator(
     field: string,
-    type: FieldType | undefined,
+    type: FieldType,
     operator: string,
     value: unknown,
-    timestamp: boolean,
     context: string,
   ): { sql: string; params: SQLInputValue[] } {
     if (operator === 'isNull') {
@@ -967,7 +1115,7 @@ export class Model<F extends ModelFields = ModelFields> {
         if (item === null || item === undefined) {
           throw new ValidationError(`${context} "in" lists cannot contain null; use isNull to match NULL values`);
         }
-        this.assertConditionValue(field, type, item, timestamp, `${context} "in" lists`);
+        this.assertConditionValue(field, type, item, `${context} "in" lists`);
       }
       // 超长列表分段：SQLite 的绑定参数总数有上限
       const chunks: SQLInputValue[][] = [];
@@ -992,7 +1140,7 @@ export class Model<F extends ModelFields = ModelFields> {
         if (item === null || item === undefined) {
           throw new ValidationError(`${context} "between" bounds cannot be null`);
         }
-        this.assertConditionValue(field, type, item, timestamp, `${context} "between" bounds`);
+        this.assertConditionValue(field, type, item, `${context} "between" bounds`);
       }
       return { sql: `"${field}" BETWEEN ? AND ?`, params: value as SQLInputValue[] };
     }
@@ -1001,26 +1149,33 @@ export class Model<F extends ModelFields = ModelFields> {
         `${context} "${operator}" requires a non-null value; use { isNull: true } to match NULL values`,
       );
     }
-    this.assertConditionValue(field, type, value, timestamp, context);
+    this.assertConditionValue(field, type, value, context);
     return { sql: `"${field}" ${COMPARISON_SQL[operator]} ?`, params: [value as SQLInputValue] };
   }
 
-  /** 校验条件里的单个值：时间戳列只接受字符串，其余按字段类型校验。 */
-  private assertConditionValue(
-    _field: string,
-    type: FieldType | undefined,
-    value: unknown,
-    timestamp: boolean,
-    context: string,
-  ): void {
-    if (timestamp) {
-      assertTimestampValue(value);
-      return;
-    }
-    if (type === undefined) {
-      throw new ValidationError(`${context} reference an unknown field`);
-    }
+  /**
+   * 校验条件里的单个值。`type` 已由 `columnType()` 统一解析，
+   * 托管列（id → INTEGER、时间戳 → TEXT）不需要任何特殊分支。
+   */
+  private assertConditionValue(_field: string, type: FieldType, value: unknown, _context: string): void {
     assertFieldValue(type, value);
+  }
+
+  /**
+   * 解析列名对应的存储类型：模型声明的字段优先，其次是托管列。
+   * 返回 undefined 表示该列不存在（调用方负责抛出脱敏错误）。
+   */
+  private columnType(field: string): FieldType | undefined {
+    return this.fieldTypes.get(field) ?? managedColumnType(field);
+  }
+
+  /**
+   * 把列名规范化为数据库中真实的列名：模型字段原样返回，托管列统一大小写
+   * （`createdat` → `createdAt`），未知列返回 undefined。
+   */
+  private canonicalColumn(field: string): string | undefined {
+    if (this.fieldTypes.has(field)) return field;
+    return reservedFieldName(field) ?? undefined;
   }
 
   /**
@@ -1083,15 +1238,18 @@ export class Model<F extends ModelFields = ModelFields> {
   }
 
   /** 校验 updateMany / deleteMany 的选项，并拒绝未知键。 */
-  private validateUpdateManyOptions(options: UpdateManyOptions | undefined): { chunkSize: number } {
+  private validateUpdateManyOptions(
+    options: UpdateManyOptions | undefined,
+    extraKeys: readonly string[] = [],
+  ): { chunkSize: number } {
     if (options === undefined) return { chunkSize: DEFAULT_MUTATION_CHUNK };
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new ValidationError(
-        `options must be an object with chunkSize or undefined, received ${describeValue(options)}`,
+        `options must be an object with ${['chunkSize', ...extraKeys].join('/')} or undefined, received ${describeValue(options)}`,
       );
     }
     for (const key of Object.keys(options)) {
-      if (key !== 'chunkSize') {
+      if (key !== 'chunkSize' && !extraKeys.includes(key)) {
         throw new ValidationError(`Unknown option "${key}" in batch mutation options`);
       }
     }
@@ -1114,7 +1272,10 @@ export class Model<F extends ModelFields = ModelFields> {
     limit?: number;
     offset?: number;
   } {
-    const allowed = ['orderBy', 'order', 'limit', 'offset', 'select', ...extraKeys];
+    // findOne 不接受 limit / offset：前者语义上恒为 1，后者没有意义，允许传入只会误导调用方
+    const allowed = ['orderBy', 'order', 'limit', 'offset', 'select', ...extraKeys].filter(
+      (key) => !(context === 'findOne()' && (key === 'limit' || key === 'offset')),
+    );
     if (options === undefined) return { orderBy: PRIMARY_KEY, order: 'DESC' };
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new ValidationError(
@@ -1131,14 +1292,15 @@ export class Model<F extends ModelFields = ModelFields> {
       const field = options.orderBy;
       if (typeof field !== 'string') {
         throw new ValidationError(
-          `${context} options.orderBy must be a field declared on the model (or "${PRIMARY_KEY}"), received ${describeValue(field)}`,
+          `${context} options.orderBy must be a field declared on the model (or a managed column), received ${describeValue(field)}`,
         );
       }
-      // 主键不在 fieldTypes 里（它是自动管理的列），但按主键排序是最常见的分页用法，需单独放行
-      if (field !== PRIMARY_KEY && this.fieldTypes.get(field) === undefined) {
+      // 托管列可以排序：id 是分页的默认键，createdAt 则是「按时间倒序」的自然表达
+      const canonical = this.canonicalColumn(field);
+      if (canonical === undefined) {
         throw this.unknownFieldError(field, `${context} options.orderBy`);
       }
-      orderBy = field;
+      orderBy = canonical;
     }
     let order: 'ASC' | 'DESC' = 'DESC';
     if (options.order !== undefined) {
@@ -1289,14 +1451,15 @@ export class Model<F extends ModelFields = ModelFields> {
     if (options.orderBy !== undefined) {
       if (typeof options.orderBy !== 'string') {
         throw new ValidationError(
-          `findPage() options.orderBy must be a field declared on the model (or "${PRIMARY_KEY}"), ` +
+          `findPage() options.orderBy must be a field declared on the model (or a managed column), ` +
             `received ${describeValue(options.orderBy)}`,
         );
       }
-      if (options.orderBy !== PRIMARY_KEY && this.fieldTypes.get(options.orderBy) === undefined) {
+      const canonical = this.canonicalColumn(options.orderBy);
+      if (canonical === undefined) {
         throw this.unknownFieldError(options.orderBy, 'findPage() options.orderBy');
       }
-      orderBy = options.orderBy;
+      orderBy = canonical;
     }
 
     let order: 'ASC' | 'DESC' = 'DESC';

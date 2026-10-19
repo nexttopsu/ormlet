@@ -44,7 +44,7 @@ describe('syncFields 字段同步', () => {
       const next = User.create({ name: '李四', age: 30, email: 'l@example.com' });
       assert.equal(next.age, 30);
       assert.equal(User.count({ email: 'l@example.com' }), 1);
-      assert.equal(User.update(created.id, { age: 25 }), true);
+      assert.equal(User.update(created.id, { age: 25 })?.age, 25);
       db2.close();
     } finally {
       cleanup();
@@ -241,7 +241,7 @@ describe('自动时间戳字段', () => {
       assert.ok(typeof fresh.updatedAt === 'string');
 
       // 旧行更新后 updatedAt 被写入，createdAt 保持 NULL
-      assert.equal(User.update(1, { name: '旧数据改' }), true);
+      assert.equal(User.update(1, { name: '旧数据改' })?.name, '旧数据改');
       const updated = User.findById(1);
       assert.ok(typeof updated?.updatedAt === 'string');
       assert.equal(updated?.createdAt, null);

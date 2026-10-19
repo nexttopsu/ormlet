@@ -749,3 +749,200 @@ describe('count by column', () => {
     );
   });
 });
+
+describe('where on managed columns', () => {
+  test('matches rows by id', () => {
+    const a = User.create({ name: 'a', age: 1 });
+    const b = User.create({ name: 'b', age: 2 });
+    const c = User.create({ name: 'c', age: 3 });
+
+    assert.deepEqual(
+      User.findMany({ id: a.id }).map((row) => row.name),
+      ['a'],
+    );
+    assert.deepEqual(
+      User.findMany({ id: { in: [a.id, c.id] } }, { orderBy: 'id', order: 'ASC' }).map((row) => row.name),
+      ['a', 'c'],
+    );
+    assert.equal(User.count({ id: { in: [a.id, b.id] } }), 2);
+    assert.equal(User.exists({ id: b.id }), true);
+    assert.equal(User.exists({ id: 999 }), false);
+    assert.equal(User.findOne({ id: 999 }), undefined);
+  });
+
+  test('rejects ids that are not positive safe integers', () => {
+    assert.throws(() => User.findMany(invalid({ id: 0 })), ValidationError);
+    assert.throws(() => User.findMany(invalid({ id: 1.5 })), ValidationError);
+    assert.throws(() => User.findMany(invalid({ id: '1' })), ValidationError);
+    assert.throws(() => User.findMany(invalid({ id: { in: [null] } })), ValidationError);
+    assert.throws(() => User.findMany(invalid({ id: { between: ['1', '2'] } })), ValidationError);
+  });
+
+  test('filters by timestamp range', () => {
+    User.create({ name: 'a' });
+    const past = '2000-01-01T00:00:00.000Z';
+    const future = '2100-01-01T00:00:00.000Z';
+
+    assert.equal(User.count({ createdAt: { gte: past } }), 1);
+    assert.equal(User.count({ createdAt: { gte: future } }), 0);
+    assert.equal(User.count({ createdAt: { between: [past, future] } }), 1);
+    assert.equal(User.count({ createdAt: { lt: past } }), 0);
+    // 时间戳是 TEXT 列，非字符串一律拒绝
+    assert.throws(() => User.findMany(invalid({ createdAt: 0 })), ValidationError);
+    assert.throws(() => User.count(invalid({ updatedAt: { gte: true } })), ValidationError);
+  });
+
+  test('supports isNull on manually created rows', () => {
+    db.exec(`CREATE TABLE legacy ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT) STRICT`);
+    const Legacy = db.model('Legacy', { tableName: 'legacy', fields: { name: 'TEXT' } });
+    Legacy.create({ name: 'x' });
+
+    // 新建的行总是写入时间戳，因此这里只校验可以按 NULL 语义查询而不会报错
+    assert.equal(Legacy.count({ createdAt: { isNull: true } }), 0);
+    assert.equal(Legacy.count({ createdAt: { isNull: false } }), 1);
+  });
+});
+
+describe('findOne', () => {
+  test('returns the newest row by default', () => {
+    User.create({ name: 'a', age: 10 });
+    const newest = User.create({ name: 'b', age: 20 });
+    assert.equal(User.findOne()?.id, newest.id);
+  });
+
+  test('respects where and order', () => {
+    User.createMany([
+      { name: 'a', age: 10 },
+      { name: 'b', age: 20 },
+      { name: 'c', age: 20 },
+    ]);
+    assert.equal(User.findOne({ age: 20 })?.name, 'c');
+    assert.equal(User.findOne({ age: 20 }, { order: 'ASC' })?.name, 'b');
+    assert.equal(User.findOne({ age: 999 }), undefined);
+  });
+
+  test('supports projection like findMany', () => {
+    User.create({ name: 'a', age: 10, email: 'a@x' });
+    const row = User.findOne({ name: 'a' }, { select: ['id', 'name'] });
+    assert.deepEqual(row, { id: row!.id, name: 'a' });
+    assert.deepEqual(Object.keys(row!).sort(), ['id', 'name']);
+  });
+
+  test('rejects limit and offset', () => {
+    assert.throws(() => User.findOne({}, invalid({ limit: 2 })), ValidationError);
+    assert.throws(() => User.findOne({}, invalid({ offset: 2 })), ValidationError);
+    assert.throws(() => User.findOne({}, invalid({ limt: 2 })), ValidationError);
+    // limit/offset 被显式拒绝，避免「以为能取第 2 条」的误解
+    assert.throws(
+      () => User.findOne({}, invalid({ limit: 2 })),
+      (error: Error) => error instanceof ValidationError && /Unknown option/.test(error.message),
+    );
+  });
+});
+
+describe('exists', () => {
+  test('reports presence without reading rows', () => {
+    assert.equal(User.exists(), false);
+    User.create({ name: 'a', age: 10 });
+    assert.equal(User.exists(), true);
+    assert.equal(User.exists({ age: 10 }), true);
+    assert.equal(User.exists({ age: 11 }), false);
+    assert.equal(User.exists({ age: { gt: 5 }, name: 'a' }), true);
+  });
+
+  test('rejects invalid conditions like findMany', () => {
+    assert.throws(() => User.exists(invalid({ nickname: 'x' })), ValidationError);
+    assert.throws(() => User.exists({ name: null }), ValidationError);
+  });
+
+  test('agrees with count > 0', () => {
+    User.createMany([
+      { name: 'a', age: 10 },
+      { name: 'b', age: null },
+    ]);
+    for (const where of [{ age: 10 }, { age: { isNull: true } }, { name: 'zzz' }, { age: { gte: 5 } }]) {
+      assert.equal(User.exists(where), User.count(where) > 0);
+    }
+  });
+});
+
+describe('findByIds', () => {
+  test('returns rows in the order of the given ids', () => {
+    const a = User.create({ name: 'a' });
+    const b = User.create({ name: 'b' });
+    const c = User.create({ name: 'c' });
+
+    const rows = User.findByIds([c.id, a.id, b.id]);
+    assert.deepEqual(
+      rows.map((row) => row?.name),
+      ['c', 'a', 'b'],
+    );
+  });
+
+  test('keeps a placeholder for missing ids', () => {
+    const a = User.create({ name: 'a' });
+    const rows = User.findByIds([a.id, 999, a.id]);
+    assert.equal(rows.length, 3);
+    assert.equal(rows[0]?.name, 'a');
+    assert.equal(rows[1], undefined);
+    // 重复 id 同样保持位置对应
+    assert.equal(rows[2]?.id, a.id);
+  });
+
+  test('returns an empty array for an empty list', () => {
+    assert.deepEqual(User.findByIds([]), []);
+  });
+
+  test('handles lists longer than the IN chunk size', () => {
+    const ids = User.createMany(Array.from({ length: 1200 }, (_, i) => ({ name: `u${i}` })));
+    const rows = User.findByIds(ids);
+    assert.equal(rows.length, 1200);
+    assert.equal(rows.filter((row) => row === undefined).length, 0);
+    assert.equal(rows[1199]?.name, 'u1199');
+  });
+
+  test('rejects invalid input', () => {
+    assert.throws(() => User.findByIds(invalid('1')), ValidationError);
+    assert.throws(() => User.findByIds(invalid([1, 0])), ValidationError);
+    assert.throws(() => User.findByIds(invalid([1, '2'])), ValidationError);
+    assert.throws(() => User.findByIds(invalid([1.5])), ValidationError);
+  });
+});
+
+describe('deleteMany guard rails', () => {
+  test('refuses to delete without a condition', () => {
+    User.createMany([{ name: 'a' }, { name: 'b' }]);
+    // 编译期就不允许无参调用，这里绕过类型检查验证运行期行为
+    assert.throws(() => User.deleteMany(invalid(undefined)), ValidationError);
+    assert.throws(() => User.deleteMany(invalid({})), ValidationError);
+    // 拒绝之后数据必须完好
+    assert.equal(User.count(), 2);
+  });
+
+  test('clear() removes every row', () => {
+    User.createMany([{ name: 'a' }, { name: 'b' }, { name: 'c' }]);
+    assert.deepEqual(User.clear(), { changes: 3, statements: 1 });
+    assert.equal(User.count(), 0);
+  });
+
+  test('clear() still honours chunkSize', () => {
+    User.createMany(Array.from({ length: 10 }, (_, i) => ({ name: `u${i}` })));
+    assert.deepEqual(User.clear({ chunkSize: 4 }), { changes: 10, statements: 3 });
+  });
+
+  test('explicit confirm allows an unconditional deleteMany', () => {
+    User.createMany([{ name: 'a' }, { name: 'b' }]);
+    assert.equal(User.deleteMany(invalid({}), { confirm: 'all' }).changes, 2);
+  });
+
+  test('rejects an invalid confirm value', () => {
+    User.create({ name: 'a' });
+    assert.throws(() => User.deleteMany({ name: 'a' }, invalid({ confirm: 'yes' })), ValidationError);
+  });
+
+  test('still deletes normally with a condition', () => {
+    User.createMany([{ name: 'a', age: 1 }, { name: 'b', age: 2 }]);
+    assert.equal(User.deleteMany({ age: 1 }).changes, 1);
+    assert.equal(User.count(), 1);
+  });
+});

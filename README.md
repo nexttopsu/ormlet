@@ -35,8 +35,10 @@ db.close();
 - **防注入设计**：表名 / 字段名经过标识符白名单校验后才拼接 SQL，所有数据值一律通过预编译语句参数绑定。
 - **自动建表**：注册模型时自动创建不存在的表（自增 `id` 主键 + `STRICT` 严格类型模式），并自动补齐表中缺失的模型字段。
 - **自动时间戳**：每张表自动维护 `createdAt` / `updatedAt`（ISO 8601 UTC），创建时写入、修改时自动刷新，不可手动修改或删除。
-- **条件查询**：等值 + 范围（`gt` / `gte` / `lt` / `lte`）、集合（`in`）、区间（`between`）、判空（`isNull`），编译期校验字段与值类型。
+- **条件查询**：等值 + 范围（`gt` / `gte` / `lt` / `lte`）、集合（`in`）、区间（`between`）、判空（`isNull`），编译期校验字段与值类型；托管列（`id` / `createdAt` / `updatedAt`）同样可作条件与排序字段。
+- **单行读取**：`findOne()` 取首条、`exists()` 判存在（`SELECT 1 ... LIMIT 1`）、`findByIds()` 一次取回一批主键对应的行，不必为了拿一条而写 `findMany(...)[0]`。
 - **事务与批量写入**：`db.transaction()` 提供 `BEGIN IMMEDIATE` 事务；`createMany` / `upsert` / `upsertMany` / `updateMany` / `deleteMany` 在一个事务内批量执行，比逐条写入快两个数量级。
+- **写后返回与删除护栏**：`update()` 返回更新后的整行、`delete()` 返回被删除的行（可直接用于审计）；`deleteMany()` 拒绝无条件调用，清空整表必须显式用 `clear()`。
 - **排序与分页**：`findMany` 支持 `orderBy` / `order` 自定义排序与 `limit` / `offset` 分页，配合 `count()` 即可组装分页元信息。
 - **游标分页**：`findPage()` 用 `(orderBy, id)` 游标定位，深分页不退化（实测 5 万行时第 1251 页 OFFSET 80ms → 游标 7.4ms），翻页期间插入新行也不会重复或漏行。
 - **字段投影**：`select` 只查询需要的列，避免 `SELECT *` 把 BLOB / 长 TEXT 一并读进内存，返回类型自动收窄。
@@ -108,8 +110,12 @@ const user = User.create({ name: '张三', age: 25 });
 
 // 查询
 User.findById(1);                 // 单条，不存在返回 undefined
+User.findByIds([3, 1, 2]);        // 按主键批量查询，结果与入参一一对应
+User.findOne({ email });          // 单条，不存在返回 undefined
+User.exists({ email });           // 是否存在（SELECT 1 ... LIMIT 1）
 User.findMany();                  // 全部记录，默认按 id 降序
 User.findMany({ age: 25 });       // 等值过滤，多字段之间为 AND
+User.findMany({ id: { in: [1, 2, 3] } });   // 按主键集合查询
 User.findMany(undefined, {        // 自定义排序 + 分页
   orderBy: 'age',
   order: 'ASC',
@@ -122,13 +128,15 @@ User.count();                     // SELECT COUNT(*)
 User.count({ age: 25 });          // 带过滤的计数
 User.count(undefined, { keyword: '张三' });   // 搜索结果总数
 
-// 修改：只更新传入的字段，返回是否有记录被修改
-User.update(user.id, { age: 26 });   // => true
-User.update(999, { age: 26 });       // => false（记录不存在）
+// 修改：只更新传入的字段，返回更新后的整行
+User.update(user.id, { age: 26 });   // => 更新后的行
+User.update(999, { age: 26 });       // => undefined（记录不存在）
 
-// 删除：返回是否有记录被删除
-User.delete(user.id);             // => true
-User.delete(user.id);             // => false
+// 删除：返回被删除的那一行
+User.delete(user.id);             // => 删除前的行
+User.delete(user.id);             // => undefined（已经删掉了）
+User.deleteMany({ age: { lt: 18 } });   // 批量删除必须有条件
+User.clear();                     // 清空整表（显式方法，避免误删）
 
 // 关闭数据库：可安全重复调用，关闭后任何操作都会抛 DatabaseClosedError
 db.close();
@@ -275,18 +283,63 @@ const users = User.findMany({
 ```
 
 - 操作符是固定白名单，`{ age: { like: 1 } }`、空条件对象 `{}`、类型不匹配的值都会抛 `ValidationError`（编译期同样能发现）；
-- `createdAt` / `updatedAt` 不可写入，但**可以**作为查询条件，例如 `{ createdAt: { gte: '2026-01-01T00:00:00.000Z' } }`（ISO 8601 UTC 字符串的字典序与时间序一致）；
+- **托管列（`id` / `createdAt` / `updatedAt`）可以自由作为查询条件**，与模型字段一视同仁：
+  - `id` 按 INTEGER 校验（必须是正的安全整数，`{ id: 0 }` 会被拒绝而不是静默返回空数组）；
+  - `createdAt` / `updatedAt` 按 TEXT 校验，例如 `{ createdAt: { gte: '2026-01-01T00:00:00.000Z' } }`（ISO 8601 UTC 字符串的字典序与时间序一致）；
+  - 只有**写入**路径（`create` / `update` 的 data、`upsert().on`）才拒绝托管列；
 - 超长的 `in` 列表（> 500 项）会自动拆成多段并以 `OR` 连接。
 
 `options` 排序与分页选项（全部可选，字段名和类型错误在编译期即可发现）：
 
 | 选项 | 类型 | 说明 |
 | --- | --- | --- |
-| `orderBy` | 模型声明的字段名 \| `'id'` | 排序字段，默认 `id`；允许主键 `id`，时间戳保留字段（`createdAt` / `updatedAt`）不允许 |
+| `orderBy` | 模型声明的字段名 \| 托管列名 | 排序字段，默认 `id`；托管列（`id` / `createdAt` / `updatedAt`）同样可用 |
 | `order` | `'ASC' \| 'DESC'` | 排序方向，默认 `DESC` |
 | `limit` | `number` | 返回的最大记录数，必须是正整数 |
 | `offset` | `number` | 跳过的记录数，必须是非负整数，且必须与 `limit` 一起使用 |
 | `select` | 列名数组 | 只查询指定列（字段投影）；返回类型收窄为这些列 |
+
+#### `findOne(where?, options?): ModelRow<F> | undefined`
+
+查询单条记录，无匹配返回 `undefined`。等价于 `findMany(where, { ...options, limit: 1 })[0]`，
+但内部直接 `SELECT ... LIMIT 1`，不分配中间数组。
+
+```typescript
+const user = User.findOne({ email: 'a@example.com' });
+const earliest = User.findOne({ status: 'pending' }, { order: 'ASC' });   // 最早的一条
+```
+
+- 默认返回 `id` 最大的那一条（与 `findMany` 的默认排序一致）；
+- 匹配到多行不报错，只返回排序后的第一行；
+- **不接受 `limit` / `offset`**（语义上恒为 1），传了会抛 `ValidationError`；
+- 支持 `select` 投影，返回类型相应收窄。
+
+#### `exists(where?): boolean`
+
+判断是否存在匹配记录，内部是 `SELECT 1 ... LIMIT 1`。
+
+```typescript
+if (User.exists({ email })) throw new Error('already registered');
+```
+
+只需要布尔结果时用它，而不是 `count(...) > 0`——后者必须扫描完所有匹配行。
+不传条件等价于「表非空」。
+
+#### `findByIds(ids): Array<ModelRow<F> | undefined>`
+
+按主键批量查询，一次 `WHERE id IN (...)` 取回全部行，替代 `ids.map(findById)` 的 N 次往返。
+
+```typescript
+const rows = User.findByIds([3, 1, 2]);
+// rows[0] 对应 id=3，rows[1] 对应 id=1；不存在的 id 对应 undefined
+```
+
+- **返回数组长度恒等于 `ids.length`**，`rows[i]` 与 `ids[i]` 一一对应，不必再按 id 建索引；
+  不想保留占位符时用 `rows.filter(Boolean)`，或改用 `findMany({ id: { in: ids } })`；
+- 重复的 id 会返回重复的行（同样保持位置对应）；
+- 空数组返回 `[]`，不执行任何查询；单次最多 10000 个 id；
+- 内部按 500 一段自动分批，超出 SQLite 绑定参数上限也不会失败。
+
 
 ```typescript
 // 按年龄升序取第 3 页（每页 10 条）
@@ -392,18 +445,35 @@ const filled = User.count(undefined, { column: 'email' });
 const missing = User.count() - filled;
 ```
 
-#### `update(id, data): boolean`
+#### `update(id, data): ModelRow<F> | undefined`
 
-按 `id` 更新记录，只更新传入的字段。返回是否有记录被修改；记录不存在返回 `false`。
+按 `id` 更新记录，只更新传入的字段，返回**更新后的整行**；记录不存在返回 `undefined`。
+
+```typescript
+const updated = User.update(id, { age: 31 });
+if (updated === undefined) notFound();
+```
 
 - `updatedAt` 自动刷新为当前时间；
+- 写入与回读在同一个事务中完成，不会读到并发写入的中间状态；
 - 拒绝空更新对象；
 - 不允许修改主键 `id`；
 - 字段和值分别校验（未知字段 / 类型不匹配抛 `ValidationError`）。
 
-#### `delete(id): boolean`
+> 旧版本返回 `boolean`。`if (User.update(...))` 这类写法对行对象依然成立，但
+> `User.update(...) === true` 需要改为 `!== undefined`。
 
-按 `id` 删除一条记录，返回是否有记录被删除。
+#### `delete(id): ModelRow<F> | undefined`
+
+按 `id` 删除一条记录，返回**被删除的那一行**（删除前的快照）；记录不存在返回 `undefined`。
+
+```typescript
+const removed = User.delete(id);
+if (removed !== undefined) audit.log('deleted', removed);
+```
+
+先读后删，两步在同一事务中完成，因此返回的快照一定就是被删掉的那一行。
+需要「是否删掉了」的布尔值，判断返回值是否为 `undefined` 即可。
 
 #### `createMany(rows, options?): number[]`
 
@@ -457,11 +527,29 @@ const { changes } = User.updateMany({ age: { lt: 18 } }, { email: null });
 - 内部先查主键再按 `options.chunkSize`（默认 500）分批执行，避免大表一次性持有写锁；
 - 整批在一个事务中，任一步失败全部回滚；空更新对象抛 `ValidationError`。
 
-#### `deleteMany(where?, options?): MutationResult`
+#### `deleteMany(where, options?): MutationResult`
 
 按条件批量删除，返回 `{ changes, statements }`，分批与事务语义同 `updateMany`。
 
-> 不传条件会删除整张表的所有行（与 `findMany()` 不传条件返回全部行对称），调用方需自行确认范围。
+```typescript
+User.deleteMany({ age: { lt: 18 } });
+```
+
+- **必须提供非空条件**：`deleteMany()` 与 `deleteMany({})` 都会抛 `ValidationError`。
+  读取（`findMany()` 返回全表）与删除（清空全表）的代价并不对称，
+  一次误调用就是不可恢复的数据丢失，因此清空必须显式声明意图；
+- 确实要清空时用 `clear()`，或显式传 `{ confirm: 'all' }` 走同一个入口。
+
+#### `clear(options?): MutationResult`
+
+清空整张表（`DELETE FROM`，不重置自增序列），返回 `{ changes, statements }`。
+
+```typescript
+User.clear();                    // 删掉全部行
+User.clear({ chunkSize: 1000 }); // 大表分批删除，缩短单次写锁持有时间
+```
+
+单独成方法是为了让「删全部」在调用处一眼可见，不必依赖阅读条件参数。
 
 #### `syncFields(): string[]`
 
@@ -528,10 +616,13 @@ const updated = User.findById(user.id);
 这两个字段与主键 `id` 一样是保留的自动管理字段：
 
 - 不能在模型 `fields` 中声明（抛 `InvalidModelError`）；
-- 不能通过 `create()` / `update()` 传入，也不能作为 `findMany()` / `count()` 的查询条件（抛 `ValidationError`）；
+- 不能通过 `create()` / `update()` 传入（写入路径拒绝托管列），但**可以**作为 `findMany()` / `count()` / `findOne()` / `exists()` 的查询条件和排序字段；
 - 不能通过 `deleteField()` 删除（抛 `ValidationError`）。
 
 对于旧版本库（或外部工具）创建的、没有时间戳列的表：注册模型时会自动补齐这两列（`syncFields()` 同样会补齐），已有行的值保持 `NULL`；该行下次 `update()` 时 `updatedAt` 会被写入，而 `createdAt` 保持 `NULL`（原始创建时间已不可知）。
+
+时间戳精度是毫秒：同一毫秒内对同一行连续调用两次 `update()`，`updatedAt` 的取值完全相同。
+需要严格的先后顺序（例如乐观锁）时，请用自增的版本号字段而不是时间戳。
 
 ### 类型
 
@@ -543,10 +634,11 @@ const updated = User.findById(user.id);
 | `ModelDefinition<F>` | `{ tableName: string; fields: F }` |
 | `ModelRow<F>` | 查询结果 / `create` 返回的行类型：自动字段（`id`、`createdAt`、`updatedAt`）+ 各模型字段（未赋值为 `null`） |
 | `ModelData<F>` | 写入数据 / 等值条件类型：字段全部可选，允许 `null` |
-| `WhereInput<F>` | 查询条件类型：字段 → 标量或 `FieldCondition`（操作符对象） |
+| `WhereInput<F>` | 查询条件类型：字段（含托管列 `id` / `createdAt` / `updatedAt`）→ 标量或 `FieldCondition`（操作符对象） |
 | `FieldCondition<T>` | 单个字段的条件：标量 / `null` / 操作符对象（`eq`、`ne`、`gt`、`gte`、`lt`、`lte`、`in`、`between`、`isNull`） |
 | `WhereOperator` | 操作符名称联合类型 |
 | `QueryOptions<F>` | `findMany` 的排序与分页选项：`orderBy` / `order` / `limit` / `offset` / `select` |
+| `SortableName<F>` | 可排序的列名：模型字段 + `id` / `createdAt` / `updatedAt`（与 `SelectableName` 同义） |
 | `SearchOptions<F>` | `search` 的选项：`fields`（参与搜索的 TEXT 字段）+ `QueryOptions` |
 | `CountOptions<F>` | `count` 的选项：`keyword` / `fields` / `column`（按列统计非 NULL 行） |
 | `SelectableName<F>` | 可投影的列名：模型字段 + `id` / `createdAt` / `updatedAt` |
@@ -557,7 +649,8 @@ const updated = User.findById(user.id);
 | `Page<R>` | `findPage` 的返回值：`items` / `nextCursor` / `hasMore` |
 | `CreateManyOptions` | `createMany` 的选项：`chunkSize` / `strictFields` |
 | `UpsertOptions<F>` | `upsert` / `upsertMany` 的选项：`on` / `update` |
-| `UpdateManyOptions` | `updateMany` / `deleteMany` 的选项：`chunkSize` |
+| `UpdateManyOptions` | `updateMany` 的选项：`chunkSize` |
+| `DeleteManyOptions` | `deleteMany` 的选项：`chunkSize` / `confirm`（`'all'` 才允许无条件删除） |
 | `MutationResult` | 批量更新 / 删除的结果：`changes` / `statements` |
 | `ModelDataTuple<F>` | 批量写入的行数组类型（每行独立应用 `ModelData<F>`） |
 | `TextFieldNames<F>` | 模型中 TEXT 字段的字段名联合类型 |
@@ -646,7 +739,7 @@ npm run stress      # 压力测试：多进程初始化竞态 / 吞吐 / 20 万�
 
 压力测试可用 `npm run stress -- scale soak` 只跑指定场景，报告写入 `.workbuddy/stress/`（已加入 `.gitignore`）。
 
-测试覆盖：内存数据库、自动建表、全部 CRUD、条件查询、排序与分页（含按主键排序、游标分页、NULL 排序）、关键字搜索（大小写、字段限制、通配符、注入防护）、参数绑定与特殊字符、多模型共享连接、文件持久化、字段同步与删除、自动时间戳（含旧表迁移）、关闭后拒绝操作、事务（提交 / 回滚 / 嵌套拒绝）、条件操作符（范围 / 集合 / 区间 / 判空 / 超长 IN 拆分）、批量写入（分批、原子性、字段集合校验）、upsert、字段投影、按列计数、约束错误细分、并发首次打开只读恢复、非法参数拒绝、编译期类型检查等 164 个用例，全部可重复运行，不污染任何已有数据库文件。
+测试覆盖：内存数据库、自动建表、全部 CRUD（`update` / `delete` 返回值包含整行）、条件查询（含托管列 `id` / `createdAt` / `updatedAt` 作条件与排序字段）、排序与分页（含按主键排序、游标分页、NULL 排序）、单行读取（`findOne` / `exists` / `findByIds`，含超长主键列表分批）、关键字搜索（大小写、字段限制、通配符、注入防护）、参数绑定与特殊字符、多模型共享连接、文件持久化、字段同步与删除、自动时间戳（含旧表迁移）、关闭后拒绝操作、事务（提交 / 回滚 / 嵌套拒绝）、条件操作符（范围 / 集合 / 区间 / 判空 / 超长 IN 拆分）、批量写入（分批、原子性、字段集合校验）、`deleteMany` 无参拒绝与 `clear()`、upsert、字段投影、按列计数、约束错误细分、并发首次打开只读恢复、非法参数拒绝、编译期类型检查等 185 个用例，全部可重复运行，不污染任何已有数据库文件。
 
 ## 暂未实现（第一版范围外）
 

@@ -49,11 +49,56 @@ const updatedAt: string | null = created.updatedAt;
 const found: ModelRow<UserFields> | undefined = modelTyped.findById(1);
 const list: ModelRow<UserFields>[] = modelTyped.findMany({ name: '张三', age: 25 });
 const total: number = modelTyped.count({ age: 25 });
-const updated: boolean = modelTyped.update(1, { age: 26, email: null });
-const removed: boolean = modelTyped.delete(1);
+const updated: ModelRow<UserFields> | undefined = modelTyped.update(1, { age: 26, email: null });
+const removed: ModelRow<UserFields> | undefined = modelTyped.delete(1);
 const partialData: ModelData<UserFields> = { age: 26 };
 
-void [id, name, age, score, avatar, createdAt, updatedAt, found, list, total, updated, removed, partialData];
+// 单行读取与存在性判断
+const one: ModelRow<UserFields> | undefined = modelTyped.findOne({ age: 25 });
+const latest: ModelRow<UserFields> | undefined = modelTyped.findOne(undefined, { order: 'ASC' });
+const present: boolean = modelTyped.exists({ name: '张三' });
+const many: Array<ModelRow<UserFields> | undefined> = modelTyped.findByIds([1, 2, 3]);
+
+// 托管列可以出现在查询条件 / 排序 / 投影里
+const byId: ModelRow<UserFields>[] = modelTyped.findMany({ id: { in: [1, 2] } });
+const byCreated: number = modelTyped.count({ createdAt: { gte: '2026-01-01T00:00:00.000Z' } });
+const byUpdated: ModelRow<UserFields>[] = modelTyped.findMany(undefined, { orderBy: 'createdAt' });
+const idOnly = modelTyped.findMany({ id: 1 }, { select: ['id'] });
+const pickedId: number = idOnly[0]!.id;
+
+// 条件类型不匹配时编译期即报错
+// @ts-expect-error id 只接受数字
+modelTyped.findMany({ id: 'one' });
+// @ts-expect-error 时间戳只接受字符串
+modelTyped.findMany({ createdAt: 0 });
+// @ts-expect-error findOne 不接受 limit（语义上恒为 1）
+modelTyped.findOne({}, { limit: 2 });
+// @ts-expect-error deleteMany 必须有条件（清空请用 clear）
+modelTyped.deleteMany();
+
+void [
+  id,
+  name,
+  age,
+  score,
+  avatar,
+  createdAt,
+  updatedAt,
+  found,
+  list,
+  total,
+  updated,
+  removed,
+  partialData,
+  one,
+  latest,
+  present,
+  many,
+  byId,
+  byCreated,
+  byUpdated,
+  pickedId,
+];
 
 // ---- 错误用法：以下每行都必须产生编译错误 ----
 
@@ -96,8 +141,7 @@ void paged;
 
 // @ts-expect-error orderBy 未知字段
 modelTyped.findMany(undefined, { orderBy: 'nickname' });
-// @ts-expect-error orderBy 不允许保留字段
-modelTyped.findMany(undefined, { orderBy: 'createdAt' });
+// orderBy 允许托管列（上面已有正向断言），这里确认未知字段仍被拒绝
 // @ts-expect-error order 只接受 ASC / DESC
 modelTyped.findMany(undefined, { order: 'asc' });
 // @ts-expect-error 未知选项键
@@ -150,10 +194,8 @@ modelTyped.findMany({ age: { in: ['1'] } });
 modelTyped.findMany({ age: { between: [1] } });
 // @ts-expect-error isNull 只接受布尔值
 modelTyped.findMany({ email: { isNull: 'yes' } });
-// @ts-expect-error 条件字段必须是模型声明的字段
+// @ts-expect-error 条件字段必须是模型声明的字段或托管列
 modelTyped.findMany({ nickname: { gte: 1 } });
-// @ts-expect-error createdAt 不在模型声明的字段中（运行时允许，但类型层不暴露）
-modelTyped.findMany({ createdAt: { gte: '2020-01-01T00:00:00.000Z' } });
 
 // ---- 事务与批量写入 ----
 

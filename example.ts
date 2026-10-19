@@ -51,14 +51,23 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
   // 搜索结果总数（用于分页）
   console.log('count(undefined, { keyword: "example" }):', User.count(undefined, { keyword: 'example' }));
 
-  // 修改：只更新传入的字段；updatedAt 自动刷新、createdAt 保持不变
+  // 修改：只更新传入的字段，返回更新后的整行
   await sleep(5); // 等待时钟前进，确保时间戳变化可见
   console.log('update(1, { age: 26 }):', User.update(1, { age: 26 }));
-  console.log('after update:', User.findById(1));
+  console.log('update(999, ...) 不存在的记录:', User.update(999, { age: 26 }));
 
-  // 删除
+  // 单行读取与存在性判断
+  console.log('findOne({ age: 26 }):', User.findOne({ age: 26 })?.name);
+  console.log('exists({ age: 26 }):', User.exists({ age: 26 }));
+  console.log('findByIds([1, 2, 999]):', User.findByIds([1, 2, 999]).map((row) => row?.id ?? null));
+
+  // 删除：返回被删除的那一行（可用于审计）
   console.log('delete(1):', User.delete(1));
   console.log('findById(1) after delete:', User.findById(1));
+
+  // 批量删除必须有条件；清空整表用 clear()
+  console.log('deleteMany({ age: { lt: 0 } }):', User.deleteMany({ age: { lt: 0 } }));
+  console.log('clear():', User.clear());
 
   // 关闭数据库
   db.close();

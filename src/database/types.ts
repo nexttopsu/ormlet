@@ -118,12 +118,23 @@ export type FieldCondition<T> =
  * 可以直接传标量（等值），也可以传操作符对象做范围 / 集合 / 空值判断。
  * 未知字段、类型不匹配、空操作符对象在编译期和运行期都会被拒绝。
  *
+ * 自动管理的列同样可以出现在条件里（只读位置的限制只针对写入）：
+ * `id` 按 INTEGER 校验，`createdAt` / `updatedAt` 按 TEXT 校验（ISO 8601 字符串）。
+ *
  * @example
  * User.findMany({ age: { gte: 18, lt: 60 }, email: { isNull: false } });
- * User.findMany({ status: { in: ['active', 'pending'] } });
+ * User.findMany({ id: { in: [1, 2, 3] } });
+ * User.findMany({ createdAt: { gte: '2026-01-01T00:00:00.000Z' } });
  */
 export type WhereInput<F extends ModelFields> = {
   [K in keyof F]?: FieldCondition<FieldValue<F[K]>>;
+} & {
+  /** 主键条件：`{ id: 3 }` 或 `{ id: { in: [1, 2] } }` */
+  id?: FieldCondition<number>;
+  /** 创建时间条件（TEXT，ISO 8601 字符串按字典序比较，与时间序一致） */
+  createdAt?: FieldCondition<string>;
+  /** 修改时间条件（同上） */
+  updatedAt?: FieldCondition<string>;
 };
 
 /**
@@ -159,12 +170,17 @@ export type ProjectedRow<F extends ModelFields, K extends SelectableName<F> | un
 export type SelectOf<O> = O extends { select: readonly (infer C)[] } ? C : undefined;
 
 /**
+ * `orderBy` 允许的列名：模型声明的字段，或自动管理的 `id` / `createdAt` / `updatedAt`。
+ * 与 `SelectableName` 同义，单独命名只是为了让调用点的语义更清楚。
+ */
+export type SortableName<F extends ModelFields> = SelectableName<F>;
+
+/**
  * `findMany` 的排序与分页选项（全部可选）。
  */
 export interface QueryOptions<F extends ModelFields> {
-  /** 排序字段，必须是模型声明的字段；默认按 `id` 排序 */
-  /** 排序字段：模型声明的字段，或自动管理的主键 `"id"` */
-  orderBy?: (keyof F & string) | 'id';
+  /** 排序字段：模型声明的字段，或托管列（`id` / `createdAt` / `updatedAt`）；默认按 `id` 排序 */
+  orderBy?: SortableName<F>;
   /** 排序方向，默认 `DESC` */
   order?: 'ASC' | 'DESC';
   /** 返回的最大记录数，必须是正整数 */
@@ -206,8 +222,8 @@ export interface Cursor {
  * `OFFSET 100000` 需要先跳过 10 万行，而游标条件可以直接从索引上定位起点。
  */
 export interface PageOptions<F extends ModelFields> {
-  /** 排序字段：模型声明的字段，或主键 `id`；默认 `id` */
-  orderBy?: (keyof F & string) | 'id';
+  /** 排序字段：模型声明的字段，或托管列（`id` / `createdAt` / `updatedAt`）；默认 `id` */
+  orderBy?: SortableName<F>;
   /** 排序方向，默认 `DESC` */
   order?: 'ASC' | 'DESC';
   /** 每页条数，必须是正整数，默认 20 */
@@ -308,6 +324,17 @@ export type ModelDataTuple<F extends ModelFields> = readonly ModelData<F>[];
 export interface UpdateManyOptions {
   /** 单条 UPDATE 最多影响的行数，默认 500；用于限制单次写锁的持有时间 */
   chunkSize?: number;
+}
+
+/**
+ * `deleteMany` 的选项。
+ *
+ * 默认拒绝无条件的删除；只有显式传 `confirm: 'all'` 才允许清空整张表
+ * （正常写法是用 `clear()`，本选项主要给需要统一入口的动态场景）。
+ */
+export interface DeleteManyOptions extends UpdateManyOptions {
+  /** 传 `'all'` 才允许无条件删除整张表；其他取值都会被拒绝 */
+  confirm?: 'all';
 }
 
 /**

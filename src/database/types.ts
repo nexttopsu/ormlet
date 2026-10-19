@@ -300,9 +300,9 @@ export interface UpsertOptions<F extends ModelFields> {
   /**
    * 冲突判定字段，用于生成 `ON CONFLICT (...)`。
    * 这些列上必须有唯一约束（唯一索引），否则 SQLite 会直接报错。
-   * 省略时使用主键 `id`。
+   * 省略时使用主键 `id`；显式写 `['id']` 与省略等价。
    */
-  on?: Array<keyof F & string>;
+  on?: Array<(keyof F & string) | 'id'>;
   /**
    * 冲突时的更新内容；省略时用本次传入的数据覆盖（主键 / 时间戳除外）。
    * 显式传空对象表示冲突时不做任何修改。

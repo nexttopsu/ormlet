@@ -384,6 +384,16 @@ describe('deleteMany', () => {
 });
 
 describe('upsert', () => {
+  test('accepts an explicit primary key conflict target', () => {
+    // 省略 on 时默认就是主键，显式写出来应当等价（而不是被当成保留字段拒绝）
+    const first = User.upsert(invalid({ id: 7, name: 'a', age: 1 }), invalid({ on: ['id'] }));
+    assert.equal(first.id, 7);
+    const second = User.upsert(invalid({ id: 7, name: 'b' }), invalid({ on: ['id'] }));
+    assert.equal(second.id, 7);
+    assert.equal(second.name, 'b');
+    assert.equal(User.count(), 1);
+  });
+
   test('inserts when there is no conflict', () => {
     // on 指定的列必须有唯一约束，因此先建唯一索引
     db.exec('CREATE UNIQUE INDEX u_email ON users (email)');

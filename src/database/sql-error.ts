@@ -131,6 +131,10 @@ function describeConstraint(Constraint: typeof UniqueConstraintError): string {
     return 'a row with the same primary key or unique value already exists';
   }
   if (Constraint === NotNullConstraintError) return 'a required column was left empty';
-  if (Constraint === ForeignKeyConstraintError) return 'a foreign key refers to a row that does not exist';
+  // 外键冲突有两个方向：引用了不存在的父行（INSERT），或父行仍被子行引用（DELETE）。
+  // 消息保持中立，避免在删除场景下给出「引用不存在的行」这种误导性描述。
+  if (Constraint === ForeignKeyConstraintError) {
+    return 'a foreign key constraint is violated (a referenced row is missing, or is still referenced)';
+  }
   return 'a column value does not satisfy a CHECK constraint';
 }

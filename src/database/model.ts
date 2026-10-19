@@ -1198,6 +1198,11 @@ export class Model<F extends ModelFields = ModelFields> {
     }
     const seen = new Set<string>();
     for (const field of on) {
+      // 主键是默认的冲突目标，显式写出来应当与省略等价
+      if (field === PRIMARY_KEY) {
+        seen.add(field);
+        continue;
+      }
       if (typeof field !== 'string' || this.fieldTypes.get(field) === undefined) {
         throw this.unknownFieldError(field, 'upsert() options.on');
       }

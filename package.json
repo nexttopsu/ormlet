@@ -37,7 +37,7 @@
     "dev": "tsx example.ts",
     "build": "tsup",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && node --no-warnings --import tsx --test tests/database.test.ts tests/model.test.ts tests/schema.test.ts",
+    "test": "npm run typecheck && node --no-warnings --import tsx --test tests/database.test.ts tests/model.test.ts tests/schema.test.ts tests/batch.test.ts",
     "stress": "node --no-warnings --expose-gc --import tsx scripts/stress.ts",
     "prepublishOnly": "npm run build"
   },

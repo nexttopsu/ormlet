@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import type { StatementSync } from 'node:sqlite';
-import { DatabaseClosedError, InvalidModelError, ValidationError } from './errors.js';
+import { DatabaseClosedError, InvalidModelError, TransactionError, ValidationError } from './errors.js';
 import { Model } from './model.js';
 import { isLockConflict, isReadOnlyDatabaseError, translateSqliteError } from './sql-error.js';
 import type { DatabaseOptions, ModelDefinition, ModelFields } from './types.js';
@@ -196,15 +196,24 @@ export class Database {
 
   /**
    * 当前是否存在未提交的事务（`BEGIN` 之后尚未 `COMMIT` / `ROLLBACK`）。
-   * SQLite 的 `autocommit` pragma 为 0 表示事务已开启但未结束。
+   *
+   * `node:sqlite` 不支持通过 `PRAGMA autocommit` 读取事务状态（该 pragma 返回空），
+   * 因此改为「尝试再开一个事务」来探测：SQLite 在事务中执行 `BEGIN` 会立即报
+   * "cannot start a transaction within a transaction"。探测到报错就说明已在事务中，
+   * 此时不能再 `COMMIT`（那可能提交别人的事务），只能原样返回 true；
+   * 探测成功说明之前不在事务中，立即 `ROLLBACK` 撤掉探测开启的空事务。
    */
   get inTransaction(): boolean {
     this.assertOpen();
-    const row = this.connection.prepare('PRAGMA autocommit').get() as
-      | { autocommit?: number | bigint }
-      | undefined;
-    const value = row?.autocommit;
-    return (typeof value === 'bigint' ? Number(value) : value) === 0;
+    try {
+      this.connection.exec('BEGIN');
+    } catch (error) {
+      const text = error instanceof Error ? error.message : '';
+      if (/cannot start a transaction within a transaction/i.test(text)) return true;
+      translateSqliteError(error, 'Probing the transaction state');
+    }
+    this.connection.exec('ROLLBACK');
+    return false;
   }
 
   /**
@@ -217,6 +226,66 @@ export class Database {
     if (!this.inTransaction) return false;
     this.connection.exec('ROLLBACK');
     return true;
+  }
+
+  /**
+   * 在一个写事务中执行 `fn`，返回其返回值。
+   *
+   * - 使用 `BEGIN IMMEDIATE`：立即取得写锁，避免「先读后写」时升级锁失败导致的 SQLITE_BUSY；
+   * - `fn` 正常返回后提交；`fn` 抛出错误时回滚，并把原错误原样抛出；
+   * - **不支持嵌套**：已经处于事务中（本方法内部或外部手动 `BEGIN`）时直接抛 `TransactionError`，
+   *   而不是用 SAVEPOINT 模拟——模型层的写法只有一种，能避免半提交状态；
+   * - `fn` 必须是同步函数：本库的底层 API 全是同步的，异步函数会返回 Promise 并提前提交；
+   * - `fn` 内部不要调用 `close()`；关闭会回滚事务，`COMMIT` 时再抛错。
+   *
+   * 默认 `synchronous = FULL` 下每条写语句都是一次独立事务（一次 fsync），
+   * 把多次写入放进同一个事务通常能带来数量级的吞吐提升。
+   *
+   * @example
+   * const count = db.transaction(() => {
+   *   User.create({ name: '张三', age: 25 });
+   *   User.update(1, { age: 26 });
+   *   return User.count();
+   * });
+   */
+  transaction<T>(fn: (db: Database) => T): T {
+    this.assertOpen();
+    if (typeof fn !== 'function') {
+      throw new ValidationError(`transaction() expects a function, received ${describeValue(fn)}`);
+    }
+    if (this.inTransaction) {
+      throw new TransactionError(
+        'transaction() cannot be nested: a transaction is already in progress. ' +
+          'Reuse the outer transaction instead of opening a new one',
+      );
+    }
+    this.connection.exec('BEGIN IMMEDIATE');
+    let result: T;
+    try {
+      result = fn(this);
+    } catch (error) {
+      try {
+        this.connection.exec('ROLLBACK');
+      } catch {
+        // 事务可能已被数据库自身终止（例如遇到 SQLITE_FULL 等致命错误），
+        // 此时保留原始错误更重要，回滚失败不再覆盖它
+      }
+      throw error;
+    }
+    if (this.closed) {
+      throw new DatabaseClosedError('The database was closed inside transaction(); changes were rolled back');
+    }
+    try {
+      this.connection.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.connection.exec('ROLLBACK');
+      } catch {
+        // 同上：保留提交失败的原始错误
+      }
+      translateSqliteError(error, 'Committing the transaction');
+    }
+    return result;
   }
 
   /** 关闭前处理未提交事务：回滚并告警，避免数据被静默丢弃。 */
@@ -341,17 +410,6 @@ export class Database {
     }
   }
 
-  /**
-   * @internal 连接被 SQLite 判为只读时，关闭并重开一次连接以恢复写能力。
-   *
-   * 触发场景：多个进程同时初始化一个刚创建的空库，其中一个进程正在写文件头 / 切换 WAL，
-   * 其他进程的连接会缓存到「库为空」的状态并持续拒绝写入（SQLITE_READONLY 不受 busy
-   * handler 处理，重试无效）。重开连接即可拿到最新的库状态。
-   *
-   * 存在未提交事务时不做重开（否则会静默丢弃事务），返回 false 交由调用方按原错误处理。
-   * 日志模式是数据库文件级的持久属性，重开后沿用；连接上也没有长期存活的语句对象，
-   * 因此重开不会破坏调用方状态。
-   */
   reopenAfterReadOnly(): boolean {
     if (this.closed) return false;
     try {

@@ -77,6 +77,41 @@ export function assertId(id: unknown): number {
 }
 
 /**
+ * 自动管理的时间戳列（createdAt / updatedAt）的类型。
+ * 它们不允许写入，但允许作为查询条件（按时间范围查询是最常见的需求之一）。
+ */
+export function isTimestampField(field: string): boolean {
+  const lower = field.toLowerCase();
+  return lower === CREATED_AT.toLowerCase() || lower === UPDATED_AT.toLowerCase();
+}
+
+/**
+ * 校验作为查询条件的时间戳取值：TEXT 列，因此必须是字符串。
+ * 字符串按字典序比较，ISO 8601 UTC 格式（本库写入的格式）的字典序与时间序一致。
+ */
+export function assertTimestampValue(value: unknown): void {
+  if (typeof value !== 'string') {
+    throw new ValidationError(
+      `Timestamp conditions must be ISO 8601 strings (TEXT), received ${describeValue(value)}`,
+    );
+  }
+}
+
+/**
+ * 校验批量语句的行数上限选项。
+ * 单条语句携带的行数受 SQLite 绑定参数上限约束，这里把上限压到远低于 32766 的安全区间。
+ */
+export function assertChunkSize(value: unknown, context: string): number {
+  if (value === undefined) return 500;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > 5000) {
+    throw new ValidationError(
+      `${context} chunkSize must be an integer between 1 and 5000, received ${describeValue(value)}`,
+    );
+  }
+  return value;
+}
+
+/**
  * 校验字段值与声明的字段类型匹配。显式 null 允许（写入 NULL）。
  * INTEGER 额外要求安全整数，避免超出 JS 表示范围后读取报错。
  * 错误消息不包含字段名，避免泄露数据库结构。

@@ -80,11 +80,59 @@ export type ModelData<F extends ModelFields> = {
 };
 
 /**
+ * 查询条件支持的操作符（大小写敏感，均为小写）。
+ *
+ * - `eq` / `ne`：等值 / 不等（`NULL` 用 `isNull` 表达，`ne` NULL 的语义易错）
+ * - `gt` / `gte` / `lt` / `lte`：比较
+ * - `in`：集合包含，至少一项；数组元素类型必须与字段类型一致
+ * - `between`：闭区间 `[最小值, 最大值]`
+ * - `isNull`：`true` → `IS NULL`，`false` → `IS NOT NULL`
+ */
+export type WhereOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'in' | 'between' | 'isNull';
+
+/**
+ * 单个字段的条件：既可直接给值（等价于 `eq`），也可给操作符对象。
+ *
+ * 操作符对象按「先列举、后排除」推导，因此字段类型与操作符不匹配时编译期就能发现：
+ * `isNull` 只接受布尔值，`in` 只接受数组，`between` 只接受二元组，
+ * 其余操作符只接受与字段类型一致的单值。
+ */
+export type FieldCondition<T> =
+  | T
+  | null
+  | {
+      eq?: NonNullable<T>;
+      ne?: NonNullable<T>;
+      gt?: NonNullable<T>;
+      gte?: NonNullable<T>;
+      lt?: NonNullable<T>;
+      lte?: NonNullable<T>;
+      in?: readonly NonNullable<T>[];
+      between?: readonly [NonNullable<T>, NonNullable<T>];
+      isNull?: boolean;
+    };
+
+/**
+ * 查询条件：字段 → 条件，多个字段之间为 AND 关系。
+ *
+ * 可以直接传标量（等值），也可以传操作符对象做范围 / 集合 / 空值判断。
+ * 未知字段、类型不匹配、空操作符对象在编译期和运行期都会被拒绝。
+ *
+ * @example
+ * User.findMany({ age: { gte: 18, lt: 60 }, email: { isNull: false } });
+ * User.findMany({ status: { in: ['active', 'pending'] } });
+ */
+export type WhereInput<F extends ModelFields> = {
+  [K in keyof F]?: FieldCondition<FieldValue<F[K]>>;
+};
+
+/**
  * `findMany` 的排序与分页选项（全部可选）。
  */
 export interface QueryOptions<F extends ModelFields> {
   /** 排序字段，必须是模型声明的字段；默认按 `id` 排序 */
-  orderBy?: keyof F & string;
+  /** 排序字段：模型声明的字段，或自动管理的主键 `"id"` */
+  orderBy?: (keyof F & string) | 'id';
   /** 排序方向，默认 `DESC` */
   order?: 'ASC' | 'DESC';
   /** 返回的最大记录数，必须是正整数 */
@@ -114,4 +162,69 @@ export interface CountOptions<F extends ModelFields> {
   keyword?: string;
   /** 参与关键字搜索的 TEXT 字段；缺省为模型声明的全部 TEXT 字段 */
   fields?: Array<TextFieldNames<F>>;
+}
+
+/**
+ * `createMany` 的选项（全部可选）。
+ */
+export interface CreateManyOptions {
+  /**
+   * 每条 INSERT 语句携带的最大行数，默认 500。
+   * SQLite 单个语句的绑定参数上限为 32766（旧版本 999），该上限限制了单语句可插入的行数；
+   * 分批既能避开上限，也能控制单条语句的编译与内存开销。
+   */
+  chunkSize?: number;
+  /**
+   * 每行的字段集合不同时是否报错，默认 `true`。
+   *
+   * - `true`：所有行必须声明完全相同的字段（可以省略为 `undefined`，视为不写该列）。
+   *   一旦出现不一致，各行的缺失字段含义就会在 NULL 与「不写入」之间摇摆，因此直接拒绝；
+   * - `false`：逐行按 SQL 默认值插入缺失字段。只在这确实是期望行为时使用。
+   *
+   * 逐行给出的显式 `null` 与省略的 `undefined` 视为等价（都写入 NULL）。
+   */
+  strictFields?: boolean;
+}
+
+/**
+ * `upsert` 的选项。
+ */
+export interface UpsertOptions<F extends ModelFields> {
+  /**
+   * 冲突判定字段，用于生成 `ON CONFLICT (...)`。
+   * 这些列上必须有唯一约束（唯一索引），否则 SQLite 会直接报错。
+   * 省略时使用主键 `id`。
+   */
+  on?: Array<keyof F & string>;
+  /**
+   * 冲突时的更新内容；省略时用本次传入的数据覆盖（主键 / 时间戳除外）。
+   * 显式传空对象表示冲突时不做任何修改。
+   */
+  update?: ModelData<F>;
+}
+
+/**
+ * 一对多辅助类型：每行允许使用不同的字段子集。
+ * 直接写 `ModelData<F>[]` 会让 TypeScript 对数组元素做「多余属性」联合校验，
+ * 导致字段不同的多行被误判为错误，因此这里对每一行单独应用 `ModelData<F>`。
+ */
+export type ModelDataTuple<F extends ModelFields> = readonly ModelData<F>[];
+
+
+/**
+ * `updateMany` 的选项（全部可选）。
+ */
+export interface UpdateManyOptions {
+  /** 单条 UPDATE 最多影响的行数，默认 500；用于限制单次写锁的持有时间 */
+  chunkSize?: number;
+}
+
+/**
+ * `updateMany` / `deleteMany` 的执行结果。
+ */
+export interface MutationResult {
+  /** 实际修改 / 删除的行数 */
+  changes: number;
+  /** 实际执行的语句条数（按 chunkSize 分批） */
+  statements: number;
 }

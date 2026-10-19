@@ -1,16 +1,22 @@
 import type { SQLOutputValue, SQLInputValue } from 'node:sqlite';
 import type { Database } from './database.js';
-import { InvalidModelError, SqlModelError, ValidationError } from './errors.js';
+import { InvalidModelError, SqlModelError, TransactionError, ValidationError } from './errors.js';
 import { translateSqliteError, isReadOnlyDatabaseError } from './sql-error.js';
 import type {
   CountOptions,
+  CreateManyOptions,
   FieldType,
   ModelData,
+  ModelDataTuple,
   ModelDefinition,
   ModelFields,
   ModelRow,
+  MutationResult,
   QueryOptions,
   SearchOptions,
+  UpdateManyOptions,
+  UpsertOptions,
+  WhereInput,
 } from './types.js';
 import {
   CREATED_AT,
@@ -18,14 +24,43 @@ import {
   MANAGED_COLUMNS,
   PRIMARY_KEY,
   UPDATED_AT,
+  assertChunkSize,
   assertFieldValue,
   assertId,
   assertIdentifier,
+  assertTimestampValue,
   describeValue,
+  isTimestampField,
   reservedFieldName,
   toSafeInteger,
   type DataEntry,
 } from './validate.js';
+
+/** 查询条件允许的操作符（白名单，用于拒绝拼写错误与注入）。 */
+const WHERE_OPERATORS = new Set(['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'between', 'isNull']);
+
+/** 操作符 → SQL 比较符（`isNull` / `in` / `between` 单独处理）。 */
+const COMPARISON_SQL: Readonly<Record<string, string>> = {
+  eq: '=',
+  ne: '<>',
+  gt: '>',
+  gte: '>=',
+  lt: '<',
+  lte: '<=',
+};
+
+/** 单次 IN 列表的最大元素数：受 SQLite 绑定参数上限约束，超出的部分拆成多段 OR。 */
+const MAX_IN_ITEMS = 500;
+
+/** `updateMany` / `deleteMany` 的默认分批行数，限制单次写锁持有时间。 */
+const DEFAULT_MUTATION_CHUNK = 500;
+
+/** 单个字段的一个已解析条件。 */
+interface TupleCondition {
+  field: string;
+  sql: string;
+  params: SQLInputValue[];
+}
 
 /**
  * 数据模型：绑定到某张表，提供类型安全的基础 CRUD。
@@ -126,18 +161,22 @@ export class Model<F extends ModelFields = ModelFields> {
   }
 
   /**
-   * 等值条件查询，多个字段之间为 AND 关系；
+   * 条件查询，多个字段之间为 AND 关系；
    * 不传条件时返回全部记录，默认按 `id` 降序排列。
    * options 可指定排序字段、方向与分页（limit / offset）。
+   *
+   * `where` 的值既可以是标量（等值），也可以是操作符对象：
+   * `{ age: { gte: 18 } }`、`{ status: { in: ['a', 'b'] } }`、
+   * `{ deletedAt: { isNull: true } }`、`{ createdAt: { gte: '2026-01-01T00:00:00.000Z' } }`。
+   * `createdAt` / `updatedAt` 不可写入，但**可以**作为查询条件。
    */
-  findMany(where?: ModelData<F>, options?: QueryOptions<F>): ModelRow<F>[] {
-    const entries = this.validateWhere(where, 'findMany()');
+  findMany(where?: WhereInput<F>, options?: QueryOptions<F>): ModelRow<F>[] {
+    const conditions = this.validateWhere(where, 'findMany()');
     const { orderBy, order, limit, offset } = this.validateOptions(options);
-    const params = entryValues(entries);
+    const params = conditionParams(conditions);
     let sql = `SELECT * FROM "${this.tableName}"`;
-    if (entries.length > 0) {
-      sql += ` WHERE ${entries.map(([field]) => `"${field}" = ?`).join(' AND ')}`;
-    }
+    const clause = conditions.length > 0 ? ` WHERE ${conditions.map((c) => c.sql).join(' AND ')}` : '';
+    sql += clause;
     sql += ` ORDER BY "${orderBy}" ${order}`;
     if (limit !== undefined) {
       sql += ' LIMIT ?';
@@ -216,17 +255,338 @@ export class Model<F extends ModelFields = ModelFields> {
   }
 
   /**
-   * 统计记录数量，支持与 findMany 一致的等值过滤，使用 SQL `COUNT(*)` 实现。
+   * 批量插入，返回按参数顺序排列的自增 id。
+   *
+   * - 整个批次在**一个事务**中完成：默认 `synchronous = FULL` 下每条语句都要 fsync，
+   *   批量写入的吞吐通常是逐条 `create()` 的几十倍；
+   * - 所有行必须声明相同的字段（见 `CreateManyOptions.strictFields`），
+   *   因此一条语句即可插完整批，缺省字段统一写入 NULL；
+   * - 不在事务中调用时自动开启并提交；已在事务中时直接参与外层事务（失败不单独回滚）；
+   * - 不会逐行回读整行（这也是比循环调用 `create()` 快的主要原因）；
+   * - 空数组返回空数组，不执行任何语句。
+   *
+   * @example
+   * const ids = User.createMany([
+   *   { name: '张三', age: 25 },
+   *   { name: '李四', age: 30 },
+   * ]);
+   */
+  createMany(rows: ModelDataTuple<F>, options?: CreateManyOptions): number[] {
+    const { chunkSize, strictFields } = this.validateCreateManyOptions(options);
+    if (!Array.isArray(rows)) {
+      throw new ValidationError(`createMany() expects an array of objects, received ${describeValue(rows)}`);
+    }
+    if (rows.length === 0) return [];
+    const records = rows.map((row, index) => {
+      if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+        throw new ValidationError(
+          `createMany() expects an array of objects, received ${describeValue(row)} at index ${index}`,
+        );
+      }
+      const entries = Object.entries(row).filter(([, value]) => value !== undefined);
+      for (const [field] of entries) {
+        if (this.fieldTypes.get(field) === undefined) throw this.unknownFieldError(field, 'createMany()');
+      }
+      return new Map(entries);
+    });
+    // 所有行共用同一组字段与绑定顺序，空行按 NULL 处理
+    const fields: string[] = [];
+    for (const byField of records) {
+      for (const field of byField.keys()) if (!fields.includes(field)) fields.push(field);
+    }
+    if (fields.length === 0) {
+      throw new ValidationError('createMany() requires at least one field per row');
+    }
+    const values = records.map((byField, index) => {
+      if (strictFields && byField.size !== fields.length) {
+        throw new ValidationError(
+          `createMany() requires every row to have the same fields (row ${index} differs). ` +
+            'Set options.strictFields = false to fill the missing fields with NULL',
+        );
+      }
+      return fields.map((field) => {
+        const raw = byField.get(field);
+        const value = raw === undefined ? null : raw;
+        assertFieldValue(this.fieldTypes.get(field)!, value);
+        return value as SQLInputValue;
+      });
+    });
+    const now = new Date().toISOString();
+    const ids: number[] = [];
+    // 单条语句携带的行数同时受 chunkSize 与绑定参数总量限制（每行 fields + 2 个时间戳）
+    const perStatement = Math.max(1, Math.min(chunkSize, Math.floor(30000 / (fields.length + 2))));
+    this.runInTransaction(() => {
+      for (let start = 0; start < values.length; start += perStatement) {
+        const batch = values.slice(start, start + perStatement);
+        const rowSql = `(${fields.map(() => '?').join(', ')}, ?, ?)`;
+        const sql =
+          `INSERT INTO "${this.tableName}" ` +
+          `(${fields.map((field) => `"${field}"`).join(', ')}, "${CREATED_AT}", "${UPDATED_AT}") ` +
+          `VALUES ${batch.map(() => rowSql).join(', ')}`;
+        const params: SQLInputValue[] = [];
+        for (const row of batch) params.push(...row, now, now);
+        const result = this.execute('createMany()', (db) => db.prepare(sql).run(...params));
+        // 多行 VALUES 的 lastInsertRowid 是最后一行，且同一语句内的 id 连续
+        const last = toSafeInteger(result.lastInsertRowid);
+        for (let i = batch.length - 1; i >= 0; i--) ids.push(last - i);
+      }
+    });
+    return ids;
+  }
+
+  /**
+   * 插入一行；若与 `options.on`（默认主键）指定的唯一约束冲突，则更新该行。
+   *
+   * - `options.on` 指定的列上必须有唯一约束（唯一索引），否则 SQLite 会直接报错；
+   * - 省略 `options.update` 时，用本次传入的数据覆盖冲突行（`createdAt` 除外）；
+   *   显式传空对象表示冲突时不做任何修改；
+   * - 只有真正发生更新时才刷新 `updatedAt`；插入时 `createdAt` / `updatedAt` 同时写入；
+   * - 返回最终的整行（回读一次）。
+   *
+   * @example
+   * User.upsert({ email: 'z@example.com', name: '张三' }, { on: ['email'] });
+   */
+  upsert(data: ModelData<F>, options?: UpsertOptions<F>): ModelRow<F> {
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+      throw new ValidationError(`upsert() expects an object with model fields, received ${describeValue(data)}`);
+    }
+    const target = this.resolveUpsertTarget(options);
+    const now = new Date().toISOString();
+    const values = Object.entries(data).filter(([, value]) => value !== undefined);
+    // 主键是唯一允许在冲突判定中写入的保留字段（冲突本身依赖它）
+    for (const [field, value] of values) {
+      if (field === PRIMARY_KEY) {
+        assertId(value);
+        continue;
+      }
+      const type = this.fieldTypes.get(field);
+      if (type === undefined) throw this.unknownFieldError(field, 'upsert()');
+      assertFieldValue(type, value);
+    }
+    const byField = new Map(values);
+    // 显式传空对象表示「冲突时什么都不改」，因此不能用 validateEntries（它拒绝空对象）
+    const updateEntries =
+      options?.update === undefined
+        ? values.filter(([field]) => field !== CREATED_AT)
+        : this.validateUpdateEntries(options.update, 'upsert() options.update');
+    // 冲突时只更新 update 中列出的字段，其余列保持原值
+    const assignable = [...new Set(updateEntries.map(([field]) => field))].filter(
+      (field) => field !== PRIMARY_KEY && field !== CREATED_AT,
+    );
+    const assignments = assignable.map((field) => `"${field}" = excluded."${field}"`);
+    // 冲突时刷新 updatedAt；分配列表里已有它时交给 excluded（值相同）
+    if (!assignable.includes(UPDATED_AT)) assignments.push(`"${UPDATED_AT}" = excluded."${UPDATED_AT}"`);
+    const conflict = `ON CONFLICT (${target.map((field) => `"${field}"`).join(', ')}) `;
+    const updateSql = assignable.length === 0 ? 'DO NOTHING' : `DO UPDATE SET ${assignments.join(', ')}`;
+    // 统一列清单：插入用到的列 ∪ 冲突更新用到的列（缺失的列写入 NULL / 忽略）
+    const fields = [
+      ...new Set([
+        // 更新用到的列即使本次未提供，也要出现在插入列表中，否则 excluded 引用不到
+        ...updateEntries.map(([field]) => field),
+        ...byField.keys(),
+      ]),
+    ];
+    const params: SQLInputValue[] = fields.map((field) => {
+      if (byField.has(field)) return byField.get(field) as SQLInputValue;
+      return (updateEntries.find(([name]) => name === field)?.[1] ?? null) as SQLInputValue;
+    });
+    params.push(now, now);
+    const columns = [...fields, CREATED_AT, UPDATED_AT].map((field) => `"${field}"`).join(', ');
+    const placeholders = fields.map(() => '?').join(', ');
+    return this.execute('upsert()', (db) => {
+      if (assignable.length === 0) {
+        // DO NOTHING 不返回行：先尝试插入并探测是否真的插入了
+        const inserted = db
+          .prepare(
+            `INSERT INTO "${this.tableName}" (${columns}) VALUES (${placeholders}, ?, ?) ` +
+              `${conflict}DO NOTHING RETURNING "${PRIMARY_KEY}" AS id`,
+          )
+          .get(...params);
+        if (inserted !== undefined) {
+          const row = this.selectById(toSafeInteger(inserted.id as number | bigint));
+          if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
+          return row;
+        }
+        const existing = db
+          .prepare(
+            `SELECT "${PRIMARY_KEY}" AS id FROM "${this.tableName}" ` +
+              `WHERE ${target.map((field) => `"${field}" = ?`).join(' AND ')} LIMIT 1`,
+          )
+          .get(...target.map((field) => (byField.get(field) ?? null) as SQLInputValue));
+        if (existing === undefined) {
+          throw new SqlModelError('The conflicting row could not be located after upsert');
+        }
+        const row = this.selectById(toSafeInteger(existing.id as number | bigint));
+        if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
+        return row;
+      }
+      const updated = db
+        .prepare(
+          `INSERT INTO "${this.tableName}" (${columns}) VALUES (${placeholders}, ?, ?) ` +
+            `${conflict}${updateSql} RETURNING "${PRIMARY_KEY}" AS id`,
+        )
+        .get(...params);
+      if (updated === undefined) {
+        throw new SqlModelError('The upserted row could not be read back from the table');
+      }
+      const row = this.selectById(toSafeInteger(updated.id as number | bigint));
+      if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
+      return row;
+    });
+  }
+
+  /**
+   * 批量插入或更新，返回语句实际影响的行数。
+   *
+   * - 冲突判定与更新规则同 `upsert()`，整个批次在一个事务内完成；
+   * - 每行逐条执行（不使用多行 VALUES），因此各行字段集合可以不同，缺失字段写入 NULL；
+   * - 不逐行回读，只返回影响行数（插入与更新都计 1）。
+   */
+  upsertMany(rows: ModelDataTuple<F>, options?: UpsertOptions<F>): number {
+    if (rows.length === 0) return 0;
+    if (!Array.isArray(rows)) {
+      throw new ValidationError(`upsertMany() expects an array of objects, received ${describeValue(rows)}`);
+    }
+    const target = this.resolveUpsertTarget(options);
+    const now = new Date().toISOString();
+    const updateEntries =
+      options?.update === undefined
+        ? undefined
+        : this.validateUpdateEntries(options.update, 'upsertMany() options.update');
+    let changes = 0;
+    this.runInTransaction(() => {
+      for (const [index, row] of rows.entries()) {
+        if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+          throw new ValidationError(
+            `upsertMany() expects an array of objects, received ${describeValue(row)} at index ${index}`,
+          );
+        }
+        const values = Object.entries(row).filter(([, value]) => value !== undefined);
+        if (values.length === 0) {
+          throw new ValidationError(`upsertMany() requires at least one field per row (row ${index} is empty)`);
+        }
+        for (const [field, value] of values) {
+          if (field === PRIMARY_KEY) {
+            assertId(value);
+            continue;
+          }
+          const type = this.fieldTypes.get(field);
+          if (type === undefined) throw this.unknownFieldError(field, 'upsertMany()');
+          assertFieldValue(type, value);
+        }
+        const byField = new Map(values);
+        const updates =
+          updateEntries ?? values.filter(([field]) => field !== CREATED_AT);
+        const assignable = [...new Set(updates.map(([field]) => field))].filter(
+          (field) => field !== PRIMARY_KEY && field !== CREATED_AT,
+        );
+        const assignments = assignable.map((field) => `"${field}" = excluded."${field}"`);
+        if (!assignable.includes(UPDATED_AT)) assignments.push(`"${UPDATED_AT}" = excluded."${UPDATED_AT}"`);
+        const fields = [...new Set([...updates.map(([field]) => field), ...byField.keys()])];
+        const params: SQLInputValue[] = fields.map((field) =>
+          (byField.has(field)
+            ? byField.get(field)
+            : updates.find(([name]) => name === field)?.[1] ?? null) as SQLInputValue,
+        );
+        params.push(now, now);
+        const sql =
+          `INSERT INTO "${this.tableName}" ` +
+          `(${[...fields, CREATED_AT, UPDATED_AT].map((field) => `"${field}"`).join(', ')}) ` +
+          `VALUES (${fields.map(() => '?').join(', ')}, ?, ?) ` +
+          `ON CONFLICT (${target.map((field) => `"${field}"`).join(', ')}) ` +
+          (assignable.length === 0 ? 'DO NOTHING' : `DO UPDATE SET ${assignments.join(', ')}`);
+        const result = this.execute('upsertMany()', (db) => db.prepare(sql).run(...params));
+        changes += toSafeInteger(result.changes);
+      }
+    });
+    return changes;
+  }
+
+  /**
+   * 按条件批量更新，返回受影响的行数与执行的语句数。
+   *
+   * - 条件与 `findMany` 完全一致（等值与操作符，不支持关键字搜索）；
+   * - `data` 中省略的字段保持不变；`updatedAt` 对这一批行统一刷新为同一时刻；
+   * - 内部按 `chunkSize` 分批执行，每批一条 `UPDATE`，避免大表一次性持有写锁；
+   * - 不在事务中调用时整个操作包在一个事务里，任一批失败则全部回滚；
+   * - 空更新对象抛 `ValidationError`（避免「什么都没改却刷新了 updatedAt」）。
+   */
+  updateMany(where: WhereInput<F>, data: ModelData<F>, options?: UpdateManyOptions): MutationResult {
+    const conditions = this.validateWhere(where, 'updateMany()');
+    const entries = this.validateEntries(data, 'updateMany()');
+    const { chunkSize } = this.validateUpdateManyOptions(options);
+    const setParams = entryValues(entries);
+    const setSql = entries.map(([field]) => `"${field}" = ?`).join(', ');
+    const whereSql = conditions.length > 0 ? conditions.map((c) => c.sql).join(' AND ') : '1 = 1';
+    const whereParams = conditionParams(conditions);
+    const now = new Date().toISOString();
+    let changes = 0;
+    let statements = 0;
+    this.runInTransaction(() => {
+      // 只取主键，避免把整行（含 BLOB）读进内存；主键只增不减，按 id 分批不会漏行
+      const ids = this.execute('updateMany()', (db) =>
+        db
+          .prepare(`SELECT "${PRIMARY_KEY}" AS id FROM "${this.tableName}" WHERE ${whereSql} ORDER BY "${PRIMARY_KEY}"`)
+          .all(...whereParams)
+          .map((row) => toSafeInteger(row.id as number | bigint)),
+      );
+      for (let start = 0; start < ids.length; start += chunkSize) {
+        const batch = ids.slice(start, start + chunkSize);
+        const sql =
+          `UPDATE "${this.tableName}" SET ${setSql}, "${UPDATED_AT}" = ? ` +
+          `WHERE "${PRIMARY_KEY}" IN (${batch.map(() => '?').join(', ')})`;
+        const result = this.execute('updateMany()', (db) =>
+          db.prepare(sql).run(...setParams, now, ...batch),
+        );
+        changes += toSafeInteger(result.changes);
+        statements += 1;
+      }
+    });
+    return { changes, statements };
+  }
+
+  /**
+   * 按条件批量删除，返回受影响的行数与执行的语句数。
+   *
+   * - 条件与 `findMany` 完全一致；
+   * - 不传条件会删除整张表的所有行（与 `findMany()` 不传条件返回全部行对称），
+   *   因此调用方需要自己确认范围；这里不做额外的「必须带条件」限制；
+   * - 内部按 `chunkSize` 分批，整体在一个事务中执行。
+   */
+  deleteMany(where?: WhereInput<F>, options?: UpdateManyOptions): MutationResult {
+    const conditions = this.validateWhere(where, 'deleteMany()');
+    const { chunkSize } = this.validateUpdateManyOptions(options);
+    const whereSql = conditions.length > 0 ? conditions.map((c) => c.sql).join(' AND ') : '1 = 1';
+    const whereParams = conditionParams(conditions);
+    let changes = 0;
+    let statements = 0;
+    this.runInTransaction(() => {
+      const ids = this.execute('deleteMany()', (db) =>
+        db
+          .prepare(`SELECT "${PRIMARY_KEY}" AS id FROM "${this.tableName}" WHERE ${whereSql} ORDER BY "${PRIMARY_KEY}"`)
+          .all(...whereParams)
+          .map((row) => toSafeInteger(row.id as number | bigint)),
+      );
+      for (let start = 0; start < ids.length; start += chunkSize) {
+        const batch = ids.slice(start, start + chunkSize);
+        const sql = `DELETE FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" IN (${batch.map(() => '?').join(', ')})`;
+        const result = this.execute('deleteMany()', (db) => db.prepare(sql).run(...batch));
+        changes += toSafeInteger(result.changes);
+        statements += 1;
+      }
+    });
+    return { changes, statements };
+  }
+
+  /**
+   * 统计记录数量，支持与 findMany 一致的条件（等值与操作符），使用 SQL `COUNT(*)` 实现。
    * `options` 可附加关键字过滤（与 search 一致的 OR LIKE 语义），用于搜索结果的分页总数。
    */
-  count(where?: ModelData<F>, options?: CountOptions<F>): number {
-    const entries = this.validateWhere(where, 'count()');
+  count(where?: WhereInput<F>, options?: CountOptions<F>): number {
+    const conditions = this.validateWhere(where, 'count()');
     const opts = this.validateCountOptions(options);
-    const params = entryValues(entries);
-    const clauses: string[] = [];
-    if (entries.length > 0) {
-      clauses.push(entries.map(([field]) => `"${field}" = ?`).join(' AND '));
-    }
+    const params = conditionParams(conditions);
+    const clauses: string[] = conditions.map((c) => c.sql);
     if (opts.fields !== undefined && opts.keyword === undefined) {
       throw new ValidationError('count() options.fields requires options.keyword');
     }
@@ -372,32 +732,252 @@ export class Model<F extends ModelFields = ModelFields> {
   }
 
   /**
-   * 校验查询条件：与写入相同的字段白名单与类型校验；
-   * 额外拒绝 null 条件（SQL 中 `column = NULL` 永远不成立，属于常见误用）。
+   * 校验冲突更新用的字段集合：与 `validateEntries` 相同，但**允许空对象**
+   * （`upsert` 中空对象表示冲突时不做任何修改，对应 `DO NOTHING`）。
    */
-  private validateWhere(where: ModelData<F> | undefined, context: string): DataEntry[] {
-    if (where === undefined) return [];
-    if (where === null || typeof where !== 'object' || Array.isArray(where)) {
+  private validateUpdateEntries(data: ModelData<F>, context: string): DataEntry[] {
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
       throw new ValidationError(
-        `${context} expects an object of equality conditions or undefined, received ${describeValue(where)}`,
+        `${context} expects an object with model fields, received ${describeValue(data)}`,
       );
     }
     const entries: DataEntry[] = [];
-    for (const [field, value] of Object.entries(where)) {
+    for (const [field, value] of Object.entries(data)) {
       if (value === undefined) continue;
       const type = this.fieldTypes.get(field);
-      if (type === undefined) {
-        throw this.unknownFieldError(field, context);
-      }
-      if (value === null) {
-        throw new ValidationError(
-          `Field must be a non-null value in ${context}: SQL "column = NULL" never matches any row`,
-        );
-      }
+      if (type === undefined) throw this.unknownFieldError(field, context);
       assertFieldValue(type, value);
       entries.push([field, value as SQLInputValue]);
     }
     return entries;
+  }
+
+  /**
+   * 校验查询条件并解析为 SQL 片段。
+   *
+   * - 字段必须在模型白名单内；`createdAt` / `updatedAt` 只读，但允许作为条件；
+   * - 值可以是标量（等价 `eq`）或操作符对象，操作符必须是白名单内的已知键；
+   * - `null` 仍然直接拒绝（`column = NULL` 永远不成立），需要判空请用 `{ isNull: true }`；
+   * - 空操作符对象 `{}` 视为错误，避免「什么都没筛」却看起来筛过。
+   */
+  private validateWhere(where: WhereInput<F> | undefined, context: string): TupleCondition[] {
+    if (where === undefined) return [];
+    if (where === null || typeof where !== 'object' || Array.isArray(where)) {
+      throw new ValidationError(
+        `${context} expects an object of conditions or undefined, received ${describeValue(where)}`,
+      );
+    }
+    const conditions: TupleCondition[] = [];
+    for (const [field, condition] of Object.entries(where)) {
+      if (condition === undefined) continue;
+      const timestamp = isTimestampField(field);
+      const type = this.fieldTypes.get(field);
+      if (!timestamp && type === undefined) {
+        throw this.unknownFieldError(field, context);
+      }
+      // 只接受普通对象作为操作符容器（Uint8Array 是 BLOB 值，不是条件对象）
+      const isOperatorObject =
+        typeof condition === 'object' &&
+        condition !== null &&
+        !Array.isArray(condition) &&
+        !(condition instanceof Uint8Array);
+      if (!isOperatorObject) {
+        if (condition === null) {
+          throw new ValidationError(
+            `Field must be a non-null value in ${context}: SQL "column = NULL" never matches any row. ` +
+              'Use { isNull: true } to match NULL values',
+          );
+        }
+        this.assertConditionValue(field, type, condition, timestamp, `${context} conditions`);
+        conditions.push({ field, sql: `"${field}" = ?`, params: [condition as SQLInputValue] });
+        continue;
+      }
+      const operators = Object.entries(condition as Record<string, unknown>).filter(
+        ([, value]) => value !== undefined,
+      );
+      if (operators.length === 0) {
+        throw new ValidationError(`${context} received an empty condition object for a field`);
+      }
+      const parts: TupleCondition[] = [];
+      for (const [operator, value] of operators) {
+        if (!WHERE_OPERATORS.has(operator)) {
+          throw new ValidationError(
+            `${context} received an unknown condition operator; expected one of: ${[...WHERE_OPERATORS].join(', ')}`,
+          );
+        }
+        parts.push({
+          field,
+          ...this.buildOperator(field, type, operator, value, timestamp, `${context} conditions`),
+        });
+      }
+      // 同一字段的多个操作符之间是 AND（如 { gte: 18, lt: 60 }）
+      if (parts.length === 1) {
+        conditions.push(parts[0]!);
+      } else {
+        conditions.push({
+          field,
+          sql: `(${parts.map((part) => part.sql).join(' AND ')})`,
+          params: parts.flatMap((part) => part.params),
+        });
+      }
+    }
+    return conditions;
+  }
+
+  /** 把单个操作符解析为 SQL 片段。校验失败时抛出 ValidationError（不含字段名）。 */
+  private buildOperator(
+    field: string,
+    type: FieldType | undefined,
+    operator: string,
+    value: unknown,
+    timestamp: boolean,
+    context: string,
+  ): { sql: string; params: SQLInputValue[] } {
+    if (operator === 'isNull') {
+      if (typeof value !== 'boolean') {
+        throw new ValidationError(`${context} require a boolean for isNull, received ${describeValue(value)}`);
+      }
+      return { sql: `"${field}" IS ${value ? '' : 'NOT '}NULL`, params: [] };
+    }
+    if (operator === 'in') {
+      if (!Array.isArray(value) || value.length === 0) {
+        throw new ValidationError(
+          `${context} require a non-empty array for "in", received ${describeValue(value)}`,
+        );
+      }
+      for (const item of value) {
+        if (item === null || item === undefined) {
+          throw new ValidationError(`${context} "in" lists cannot contain null; use isNull to match NULL values`);
+        }
+        this.assertConditionValue(field, type, item, timestamp, `${context} "in" lists`);
+      }
+      // 超长列表分段：SQLite 的绑定参数总数有上限
+      const chunks: SQLInputValue[][] = [];
+      for (let start = 0; start < value.length; start += MAX_IN_ITEMS) {
+        chunks.push(value.slice(start, start + MAX_IN_ITEMS) as SQLInputValue[]);
+      }
+      return {
+        sql:
+          chunks.length === 1
+            ? `"${field}" IN (${chunks[0]!.map(() => '?').join(', ')})`
+            : `(${chunks.map((chunk) => `"${field}" IN (${chunk.map(() => '?').join(', ')})`).join(' OR ')})`,
+        params: chunks.flat(),
+      };
+    }
+    if (operator === 'between') {
+      if (!Array.isArray(value) || value.length !== 2) {
+        throw new ValidationError(
+          `${context} require a [min, max] pair for "between", received ${describeValue(value)}`,
+        );
+      }
+      for (const item of value) {
+        if (item === null || item === undefined) {
+          throw new ValidationError(`${context} "between" bounds cannot be null`);
+        }
+        this.assertConditionValue(field, type, item, timestamp, `${context} "between" bounds`);
+      }
+      return { sql: `"${field}" BETWEEN ? AND ?`, params: value as SQLInputValue[] };
+    }
+    if (value === null || value === undefined) {
+      throw new ValidationError(
+        `${context} "${operator}" requires a non-null value; use { isNull: true } to match NULL values`,
+      );
+    }
+    this.assertConditionValue(field, type, value, timestamp, context);
+    return { sql: `"${field}" ${COMPARISON_SQL[operator]} ?`, params: [value as SQLInputValue] };
+  }
+
+  /** 校验条件里的单个值：时间戳列只接受字符串，其余按字段类型校验。 */
+  private assertConditionValue(
+    _field: string,
+    type: FieldType | undefined,
+    value: unknown,
+    timestamp: boolean,
+    context: string,
+  ): void {
+    if (timestamp) {
+      assertTimestampValue(value);
+      return;
+    }
+    if (type === undefined) {
+      throw new ValidationError(`${context} reference an unknown field`);
+    }
+    assertFieldValue(type, value);
+  }
+
+  /**
+   * 在一个写事务中执行批量操作：已在事务中时直接参与外层事务，
+   * 否则开启新事务并在结束后提交（失败时回滚由 `Database.transaction` 负责）。
+   */
+  private runInTransaction<T>(fn: () => T): T {
+    if (this.database.inTransaction) return fn();
+    return this.database.transaction(fn);
+  }
+
+  /** 解析 upsert 的冲突判定字段：默认主键，否则必须是模型声明且不重复的字段。 */
+  private resolveUpsertTarget(options: UpsertOptions<F> | undefined): string[] {
+    const on = options?.on;
+    if (on === undefined) return [PRIMARY_KEY];
+    if (!Array.isArray(on) || on.length === 0) {
+      throw new ValidationError(
+        `upsert() options.on must be a non-empty array of field names, received ${describeValue(on)}`,
+      );
+    }
+    const seen = new Set<string>();
+    for (const field of on) {
+      if (typeof field !== 'string' || this.fieldTypes.get(field) === undefined) {
+        throw this.unknownFieldError(field, 'upsert() options.on');
+      }
+      if (seen.has(field)) {
+        throw new ValidationError('upsert() options.on contains duplicate fields');
+      }
+      seen.add(field);
+    }
+    return [...seen];
+  }
+
+  /** 校验 createMany 的选项，并拒绝未知键。 */
+  private validateCreateManyOptions(options: CreateManyOptions | undefined): {
+    chunkSize: number;
+    strictFields: boolean;
+  } {
+    if (options === undefined) return { chunkSize: 500, strictFields: true };
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      throw new ValidationError(
+        `createMany() options must be an object with chunkSize/strictFields or undefined, received ${describeValue(options)}`,
+      );
+    }
+    for (const key of Object.keys(options)) {
+      if (key !== 'chunkSize' && key !== 'strictFields') {
+        throw new ValidationError(`Unknown option "${key}" in createMany() options`);
+      }
+    }
+    const strictFields = options.strictFields;
+    if (strictFields !== undefined && typeof strictFields !== 'boolean') {
+      throw new ValidationError(
+        `createMany() options.strictFields must be a boolean, received ${describeValue(strictFields)}`,
+      );
+    }
+    return {
+      chunkSize: assertChunkSize(options.chunkSize, 'createMany()'),
+      strictFields: strictFields ?? true,
+    };
+  }
+
+  /** 校验 updateMany / deleteMany 的选项，并拒绝未知键。 */
+  private validateUpdateManyOptions(options: UpdateManyOptions | undefined): { chunkSize: number } {
+    if (options === undefined) return { chunkSize: DEFAULT_MUTATION_CHUNK };
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      throw new ValidationError(
+        `options must be an object with chunkSize or undefined, received ${describeValue(options)}`,
+      );
+    }
+    for (const key of Object.keys(options)) {
+      if (key !== 'chunkSize') {
+        throw new ValidationError(`Unknown option "${key}" in batch mutation options`);
+      }
+    }
+    return { chunkSize: assertChunkSize(options.chunkSize, 'Batch mutations') };
   }
 
   /**
@@ -433,11 +1013,12 @@ export class Model<F extends ModelFields = ModelFields> {
       const field = options.orderBy;
       if (typeof field !== 'string') {
         throw new ValidationError(
-          `findMany() options.orderBy must be a field declared on the model, received ${describeValue(field)}`,
+          `${context} options.orderBy must be a field declared on the model (or "${PRIMARY_KEY}"), received ${describeValue(field)}`,
         );
       }
-      if (this.fieldTypes.get(field) === undefined) {
-        throw this.unknownFieldError(field, 'findMany() options.orderBy');
+      // 主键不在 fieldTypes 里（它是自动管理的列），但按主键排序是最常见的分页用法，需单独放行
+      if (field !== PRIMARY_KEY && this.fieldTypes.get(field) === undefined) {
+        throw this.unknownFieldError(field, `${context} options.orderBy`);
       }
       orderBy = field;
     }
@@ -445,7 +1026,7 @@ export class Model<F extends ModelFields = ModelFields> {
     if (options.order !== undefined) {
       if (options.order !== 'ASC' && options.order !== 'DESC') {
         throw new ValidationError(
-          `findMany() options.order must be "ASC" or "DESC", received ${describeValue(options.order)}`,
+          `${context} options.order must be "ASC" or "DESC", received ${describeValue(options.order)}`,
         );
       }
       order = options.order;
@@ -453,19 +1034,19 @@ export class Model<F extends ModelFields = ModelFields> {
     if (options.limit !== undefined) {
       if (typeof options.limit !== 'number' || !Number.isSafeInteger(options.limit) || options.limit < 1) {
         throw new ValidationError(
-          `findMany() options.limit must be a positive integer, received ${describeValue(options.limit)}`,
+          `${context} options.limit must be a positive integer, received ${describeValue(options.limit)}`,
         );
       }
     }
     if (options.offset !== undefined) {
       if (options.limit === undefined) {
         throw new ValidationError(
-          'findMany() options.offset requires options.limit (SQLite OFFSET requires LIMIT)',
+          `${context} options.offset requires options.limit (SQLite OFFSET requires LIMIT)`,
         );
       }
       if (typeof options.offset !== 'number' || !Number.isSafeInteger(options.offset) || options.offset < 0) {
         throw new ValidationError(
-          `findMany() options.offset must be a non-negative integer, received ${describeValue(options.offset)}`,
+          `${context} options.offset must be a non-negative integer, received ${describeValue(options.offset)}`,
         );
       }
     }
@@ -575,4 +1156,9 @@ export class Model<F extends ModelFields = ModelFields> {
 
 function entryValues(entries: DataEntry[]): SQLInputValue[] {
   return entries.map(([, value]) => value);
+}
+
+/** 按条件顺序展开绑定参数（与 SQL 中 `?` 的出现顺序一致）。 */
+function conditionParams(conditions: TupleCondition[]): SQLInputValue[] {
+  return conditions.flatMap((condition) => condition.params);
 }

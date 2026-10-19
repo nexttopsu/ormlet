@@ -103,6 +103,10 @@ modelTyped.findMany(undefined, { order: 'asc' });
 // @ts-expect-error 未知选项键
 modelTyped.findMany(undefined, { limt: 5 });
 
+// 主键 id 不在模型声明里，但允许作为 orderBy（最常见的分页排序）
+const byPk: ModelRow<UserFields>[] = modelTyped.findMany(undefined, { orderBy: 'id', order: 'ASC' });
+void byPk;
+
 // ---- search 关键字搜索 ----
 
 const searched: ModelRow<UserFields>[] = modelTyped.search('张', {
@@ -122,3 +126,57 @@ modelTyped.search('x', { fields: ['nickname'] });
 modelTyped.search('x', { fields: ['age'] });
 // @ts-expect-error count 的 fields 只允许 TEXT 字段
 modelTyped.count(undefined, { keyword: 'x', fields: ['age'] });
+
+// ---- 查询条件操作符 ----
+
+const ranged: ModelRow<UserFields>[] = modelTyped.findMany({
+  age: { gte: 18, lt: 60 },
+  name: { in: ['张三', '李四'] },
+  score: { between: [0, 100] },
+  email: { isNull: false },
+});
+const neCount: number = modelTyped.count({ age: { ne: 0 } });
+void [ranged, neCount];
+
+// @ts-expect-error 未知操作符
+modelTyped.findMany({ age: { like: 1 } });
+// @ts-expect-error INTEGER 字段的范围值必须是数字
+modelTyped.findMany({ age: { gte: '18' } });
+// @ts-expect-error in 必须是数组
+modelTyped.findMany({ age: { in: 1 } });
+// @ts-expect-error in 的元素类型必须与字段一致
+modelTyped.findMany({ age: { in: ['1'] } });
+// @ts-expect-error between 必须是二元组
+modelTyped.findMany({ age: { between: [1] } });
+// @ts-expect-error isNull 只接受布尔值
+modelTyped.findMany({ email: { isNull: 'yes' } });
+// @ts-expect-error 条件字段必须是模型声明的字段
+modelTyped.findMany({ nickname: { gte: 1 } });
+// @ts-expect-error createdAt 不在模型声明的字段中（运行时允许，但类型层不暴露）
+modelTyped.findMany({ createdAt: { gte: '2020-01-01T00:00:00.000Z' } });
+
+// ---- 事务与批量写入 ----
+
+const inTx: number = db.transaction(() => 1);
+const txNested: number[] = db.transaction(() =>
+  modelTyped.createMany([
+    { name: 'a', age: 1 },
+    { name: 'b', age: 2 },
+  ]),
+);
+void [inTx, txNested];
+
+// @ts-expect-error 批量行中的未知字段
+modelTyped.createMany([{ nickname: 'x' }]);
+// @ts-expect-error 批量行中的错误值类型
+modelTyped.createMany([{ age: '25' }]);
+
+const upserted: ModelRow<UserFields> = modelTyped.upsert({ name: 'a' }, { on: ['name'] });
+// @ts-expect-error upsert 的 on 必须是已声明字段
+modelTyped.upsert({ name: 'a' }, { on: ['nickname'] });
+void upserted;
+
+const mutated = modelTyped.updateMany({ age: { gt: 0 } }, { score: 1 });
+const removedMany = modelTyped.deleteMany({ age: { isNull: true } });
+const changed: number = mutated.changes + removedMany.changes;
+void changed;

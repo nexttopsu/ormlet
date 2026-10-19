@@ -83,15 +83,22 @@ describe('create', () => {
     assert.equal(createdAt, updatedAt);
   });
 
-  test('rejects managed timestamp fields in create/update/where', () => {
+  test('rejects managed timestamp fields in create/update', () => {
     const user = User.create({ name: '张三' });
     const ts = '2020-01-01T00:00:00.000Z';
     assert.throws(() => User.create(invalid({ createdAt: ts })), ValidationError);
     assert.throws(() => User.create(invalid({ updatedAt: ts })), ValidationError);
     assert.throws(() => User.update(user.id, invalid({ createdAt: ts })), ValidationError);
     assert.throws(() => User.update(user.id, invalid({ updatedAt: ts })), ValidationError);
-    assert.throws(() => User.findMany(invalid({ createdAt: ts })), ValidationError);
-    assert.throws(() => User.count(invalid({ updatedAt: ts })), ValidationError);
+  });
+
+  test('allows managed timestamps as query conditions but only with string values', () => {
+    User.create({ name: '张三' });
+    // 时间戳只读，但按时间范围查询是常见需求，因此允许作为条件
+    assert.equal(User.findMany(invalid({ createdAt: { gte: '2000-01-01T00:00:00.000Z' } })).length, 1);
+    assert.equal(User.count(invalid({ updatedAt: { lte: '2999-01-01T00:00:00.000Z' } })), 1);
+    assert.throws(() => User.findMany(invalid({ createdAt: 1 })), ValidationError);
+    assert.throws(() => User.count(invalid({ updatedAt: { gte: 123 } })), ValidationError);
   });
 
   test('rejects an empty data object', () => {
@@ -380,13 +387,22 @@ describe('findMany 排序与分页', () => {
   test('rejects invalid orderBy', () => {
     User.create({ name: 'a' });
     assert.throws(() => User.findMany(undefined, invalid({ orderBy: 'nickname' })), ValidationError);
-    assert.throws(() => User.findMany(undefined, invalid({ orderBy: 'id' })), ValidationError);
     assert.throws(() => User.findMany(undefined, invalid({ orderBy: 'createdAt' })), ValidationError);
     assert.throws(
       () => User.findMany(undefined, invalid({ orderBy: 'name; DROP TABLE users' })),
       ValidationError,
     );
     assert.throws(() => User.findMany(undefined, invalid({ orderBy: 123 })), ValidationError);
+  });
+
+  test('allows the managed id as orderBy', () => {
+    User.create({ name: 'a' });
+    User.create({ name: 'b' });
+    const asc = User.findMany(undefined, { orderBy: 'id', order: 'ASC' }).map((row) => row.id);
+    assert.deepEqual(asc, [1, 2]);
+    // 不传 orderBy 时默认已按 id DESC，显式传 id 应得到同样结果
+    const desc = User.findMany(undefined, { orderBy: 'id' }).map((row) => row.id);
+    assert.deepEqual(desc, [2, 1]);
   });
 
   test('rejects invalid order values', () => {

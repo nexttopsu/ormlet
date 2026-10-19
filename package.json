@@ -1,6 +1,6 @@
 {
   "name": "ormlet",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "Lightweight, type-safe SQLite data-model layer for Node.js, built on the native node:sqlite module. Zero runtime dependencies.",
   "repository": {
     "type": "git",

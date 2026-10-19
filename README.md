@@ -48,6 +48,7 @@ db.close();
 - [性能与实践](#性能与实践)
 - [迁移与版本管理](#迁移与版本管理)
 - [资源与错误处理](#资源与错误处理)
+- [从 1.x 升级](#从-1x-升级)
 - [开发](#开发)
 - [暂未实现](#暂未实现第一版范围外)
   - [外键行为](#外键行为)
@@ -1232,6 +1233,37 @@ db.exec(`VACUUM INTO './backup-2026-10-19.db'`);
   `id`、`changes`、`COUNT(*)` 一律以安全整数 `number` 返回。
 - 只读连接（`SQLITE_READONLY`）会被自动识别并重开恢复，不需要调用方重试；
   事务进行中除外，此时可用 `db.reopenAfterReadOnly()` 手动恢复。
+
+## 从 1.x 升级
+
+2.0 的不兼容改动只有两处，都在写入返回值上：
+
+| 方法 | 1.x | 2.0 |
+|---|---|---|
+| `update(id, data)` | `boolean` | 更新后的整行；未命中为 `undefined` |
+| `delete(id)` | `boolean` | 被删除行的快照；未命中为 `undefined` |
+
+**布尔上下文里的代码不用改**：命中返回对象（真值），未命中返回 `undefined`（假值），
+`if (!User.update(id, data)) { /* 未命中 */ }` 在 1.x 和 2.0 下行为一致。
+需要改的是显式写成布尔的地方：
+
+```typescript
+// 1.x / 2.0 都能编译，但 2.0 下这段是类型错误
+const ok: boolean = User.update(id, { age: 26 });
+// 改成：
+const ok = User.update(id, { age: 26 }) !== undefined;
+```
+
+要多取整行时反而省一次查询——写和读回在同一个事务里完成，不会读到别人并发的修改。
+
+其余都是新增，不影响既有代码：
+
+- 读写两侧都能用托管列：`where: { id: 5 }`、`orderBy: 'createdAt'`（写入位置仍拒绝）；
+- 单行读取 `findOne()` / `exists()` / `findByIds()`；
+- `deleteMany()` 必须有非空条件，清空整表改用 `clear()`（避免漏传参数误删）；
+- 事务 `db.transaction()`、批量写入 `createMany` / `updateMany` / `upsertMany`；
+- 游标分页 `findPage()`、字段投影 `select`、按列计数 `count(_, { column })`；
+- 约束错误细分：`UniqueConstraintError` / `NotNullConstraintError` / `ForeignKeyConstraintError`。
 
 ## 开发
 

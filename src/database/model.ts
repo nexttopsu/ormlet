@@ -5,6 +5,7 @@ import { translateSqliteError, isReadOnlyDatabaseError } from './sql-error.js';
 import type {
   CountOptions,
   CreateManyOptions,
+  Cursor,
   FieldType,
   ModelData,
   ModelDataTuple,
@@ -12,8 +13,13 @@ import type {
   ModelFields,
   ModelRow,
   MutationResult,
+  Page,
+  PageOptions,
+  ProjectedRow,
   QueryOptions,
   SearchOptions,
+  SelectedRow,
+  SelectableName,
   UpdateManyOptions,
   UpsertOptions,
   WhereInput,
@@ -30,6 +36,7 @@ import {
   assertIdentifier,
   assertTimestampValue,
   describeValue,
+  isManagedColumn,
   isTimestampField,
   reservedFieldName,
   toSafeInteger,
@@ -38,7 +45,6 @@ import {
 
 /** 查询条件允许的操作符（白名单，用于拒绝拼写错误与注入）。 */
 const WHERE_OPERATORS = new Set(['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'between', 'isNull']);
-
 /** 操作符 → SQL 比较符（`isNull` / `in` / `between` 单独处理）。 */
 const COMPARISON_SQL: Readonly<Record<string, string>> = {
   eq: '=',
@@ -54,6 +60,9 @@ const MAX_IN_ITEMS = 500;
 
 /** `updateMany` / `deleteMany` 的默认分批行数，限制单次写锁持有时间。 */
 const DEFAULT_MUTATION_CHUNK = 500;
+
+/** `findPage` 未指定 limit 时的每页条数。 */
+const DEFAULT_PAGE_SIZE = 20;
 
 /** 单个字段的一个已解析条件。 */
 interface TupleCondition {
@@ -146,7 +155,8 @@ export class Model<F extends ModelFields = ModelFields> {
       `VALUES (${entries.map(() => '?').join(', ')})`;
     const result = this.execute('create()', (db) => db.prepare(sql).run(...entryValues(entries)));
     const id = toSafeInteger(result.lastInsertRowid);
-    const row = this.selectById(id);
+    // create() 总是插入全部列，回读必为完整行（不使用投影）
+    const row = this.selectById(id) as ModelRow<F> | undefined;
     if (row === undefined) {
       throw new SqlModelError(`Inserted row (id = ${id}) could not be read back from the table`);
     }
@@ -155,9 +165,20 @@ export class Model<F extends ModelFields = ModelFields> {
 
   /**
    * 按自增主键查询单条记录，不存在时返回 undefined。
+   * 传 `options.select` 时只查询指定列，返回类型相应收窄。
    */
-  findById(id: number): ModelRow<F> | undefined {
-    return this.selectById(assertId(id));
+  findById(id: number, options?: { select?: undefined }): ModelRow<F> | undefined;
+  findById<K extends SelectableName<F>>(
+    id: number,
+    options: { select: readonly K[] },
+  ): SelectedRow<F, K> | undefined;
+  findById(
+    id: number,
+    options?: { select?: readonly SelectableName<F>[] },
+  ): ModelRow<F> | Record<string, SQLOutputValue> | undefined {
+    const safeId = assertId(id);
+    const columns = this.projection(options?.select, 'findById()');
+    return this.selectById(safeId, columns);
   }
 
   /**
@@ -170,11 +191,23 @@ export class Model<F extends ModelFields = ModelFields> {
    * `{ deletedAt: { isNull: true } }`、`{ createdAt: { gte: '2026-01-01T00:00:00.000Z' } }`。
    * `createdAt` / `updatedAt` 不可写入，但**可以**作为查询条件。
    */
-  findMany(where?: WhereInput<F>, options?: QueryOptions<F>): ModelRow<F>[] {
+  findMany(
+    where?: WhereInput<F>,
+    options?: QueryOptions<F> & { select?: undefined },
+  ): ModelRow<F>[];
+  findMany<K extends SelectableName<F>>(
+    where: WhereInput<F> | undefined,
+    options: QueryOptions<F> & { select: readonly K[] },
+  ): SelectedRow<F, K>[];
+  findMany(
+    where?: WhereInput<F>,
+    options?: QueryOptions<F>,
+  ): ModelRow<F>[] | Array<Record<string, SQLOutputValue>> {
     const conditions = this.validateWhere(where, 'findMany()');
     const { orderBy, order, limit, offset } = this.validateOptions(options);
+    const columns = this.projection(options?.select, 'findMany()');
     const params = conditionParams(conditions);
-    let sql = `SELECT * FROM "${this.tableName}"`;
+    let sql = `SELECT ${columns} FROM "${this.tableName}"`;
     const clause = conditions.length > 0 ? ` WHERE ${conditions.map((c) => c.sql).join(' AND ')}` : '';
     sql += clause;
     sql += ` ORDER BY "${orderBy}" ${order}`;
@@ -194,19 +227,100 @@ export class Model<F extends ModelFields = ModelFields> {
     );
   }
   /**
+   * 游标（keyset）分页：按 `(orderBy, id)` 定位起点，而不是用 `OFFSET` 跳过前 N 行。
+   *
+   * - **深分页不退化**：`OFFSET 100000` 要先扫过 10 万行再丢弃，游标条件可以直接从索引定位，
+   *   第 1 页与第 5000 页的成本基本相同；
+   * - **结果稳定**：翻页期间有新行插入也不会重复或漏掉已看过的行（`OFFSET` 会整体错位）；
+   * - 排序字段有重复值时用主键 `id` 打破平局，保证顺序确定；
+   * - 排序字段为 NULL 的行：SQLite 把 NULL 视为最小值，这里保持同样的顺序，
+   *   NULL 行之间继续用主键比较——行值比较 `(a, b) > (x, y)` 遇到 NULL 恒为 NULL，不能直接用；
+   * - `options.limit` 缺省 20；不接受 `offset`（与游标语义冲突，传了会被拒绝）。
+   *
+   * @example
+   * let cursor = null;
+   * for (;;) {
+   *   const page = User.findPage({ orderBy: 'age', order: 'ASC', limit: 20, after: cursor });
+   *   render(page.items);
+   *   if (!page.hasMore) break;
+   *   cursor = page.nextCursor;
+   * }
+   */
+  findPage<K extends SelectableName<F> = never>(
+    options?: PageOptions<F> & { select?: readonly K[] },
+  ): Page<ProjectedRow<F, [K] extends [never] ? undefined : K>>;
+  findPage(options?: PageOptions<F> & { select?: readonly SelectableName<F>[] }): Page<
+    ModelRow<F> | Record<string, SQLOutputValue>
+  > {
+    // 实现签名只关心「有没有 select」，返回类型的收窄交给上面的泛型重载
+    const { orderBy, order, limit, after } = this.validatePageOptions(options);
+    const columns = this.projection(options?.select, 'findPage()');
+    const cursor = this.cursorCondition(orderBy, order, after);
+    const params: SQLInputValue[] = [...cursor.params];
+
+    // 排序字段与主键都必须出现在结果里，否则无法生成下一页的游标
+    const needed = orderBy === PRIMARY_KEY ? [PRIMARY_KEY] : [orderBy, PRIMARY_KEY];
+    const requested = options?.select as readonly string[] | undefined;
+    const missing = requested === undefined ? [] : needed.filter((column) => !requested.includes(column));
+    const selectSql =
+      missing.length === 0 ? columns : [columns, ...missing.map((column) => `"${column}"`)].join(', ');
+
+    let sql = `SELECT ${selectSql} FROM "${this.tableName}"`;
+    if (cursor.sql !== undefined) sql += ` WHERE ${cursor.sql}`;
+    // 主键作为次级排序键，保证同值时顺序确定（否则 NULL 段内部的行顺序取决于物理存储）；
+    // 按主键排序时它本身就是唯一键，不需要再加一次
+    sql +=
+      orderBy === PRIMARY_KEY
+        ? ` ORDER BY "${PRIMARY_KEY}" ${order}`
+        : ` ORDER BY "${orderBy}" ${order}, "${PRIMARY_KEY}" ${order}`;
+    // 多取一行用于判断是否还有下一页，避免为翻页多发一次 COUNT
+    sql += ' LIMIT ?';
+    params.push(limit + 1);
+
+    const rows = this.execute('findPage()', (db) =>
+      db
+        .prepare(sql)
+        .all(...params)
+        .map((raw) => this.toRow(raw)),
+    );
+    const hasMore = rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
+    const last = items[items.length - 1];
+    return {
+      items,
+      hasMore,
+      nextCursor:
+        hasMore && last !== undefined
+          ? {
+              id: last[PRIMARY_KEY] as number,
+              value: orderBy === PRIMARY_KEY ? null : ((last[orderBy] as string | number | null) ?? null),
+            }
+          : null,
+    };
+  }
+  /**
    * 关键字搜索：对 TEXT 字段做子串匹配（`LIKE '%keyword%'`），任意字段命中即返回（OR 语义）。
    * SQLite 的 LIKE 对 ASCII 大小写不敏感；`%` 与 `_` 作为 LIKE 通配符原样生效。
    * `options.fields` 指定参与搜索的 TEXT 字段（默认全部 TEXT 字段），
    * 其余选项与 findMany 一致（orderBy / order / limit / offset）。
    * 关键字（含 `%` 包裹）整体通过参数绑定传入，不拼接 SQL。
    */
-  search(keyword: string, options?: SearchOptions<F>): ModelRow<F>[] {
+  search(keyword: string, options?: SearchOptions<F> & { select?: undefined }): ModelRow<F>[];
+  search<K extends SelectableName<F>>(
+    keyword: string,
+    options: SearchOptions<F> & { select: readonly K[] },
+  ): SelectedRow<F, K>[];
+  search(
+    keyword: string,
+    options?: SearchOptions<F>,
+  ): ModelRow<F>[] | Array<Record<string, SQLOutputValue>> {
     const kw = this.assertKeyword(keyword, 'search()');
     const { orderBy, order, limit, offset } = this.validateOptions(options, 'search()', ['fields']);
     const fields = this.textSearchFields(options?.fields, 'search()');
+    const columns = this.projection(options?.select, 'search()');
     const params: SQLInputValue[] = fields.map(() => `%${kw}%`);
     let sql =
-      `SELECT * FROM "${this.tableName}" ` +
+      `SELECT ${columns} FROM "${this.tableName}" ` +
       `WHERE (${fields.map((field) => `"${field}" LIKE ?`).join(' OR ')})`;
     sql += ` ORDER BY "${orderBy}" ${order}`;
     if (limit !== undefined) {
@@ -403,7 +517,7 @@ export class Model<F extends ModelFields = ModelFields> {
           )
           .get(...params);
         if (inserted !== undefined) {
-          const row = this.selectById(toSafeInteger(inserted.id as number | bigint));
+          const row = this.selectById(toSafeInteger(inserted.id as number | bigint)) as ModelRow<F> | undefined;
           if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
           return row;
         }
@@ -416,7 +530,7 @@ export class Model<F extends ModelFields = ModelFields> {
         if (existing === undefined) {
           throw new SqlModelError('The conflicting row could not be located after upsert');
         }
-        const row = this.selectById(toSafeInteger(existing.id as number | bigint));
+        const row = this.selectById(toSafeInteger(existing.id as number | bigint)) as ModelRow<F> | undefined;
         if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
         return row;
       }
@@ -429,7 +543,7 @@ export class Model<F extends ModelFields = ModelFields> {
       if (updated === undefined) {
         throw new SqlModelError('The upserted row could not be read back from the table');
       }
-      const row = this.selectById(toSafeInteger(updated.id as number | bigint));
+      const row = this.selectById(toSafeInteger(updated.id as number | bigint)) as ModelRow<F> | undefined;
       if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
       return row;
     });
@@ -579,8 +693,11 @@ export class Model<F extends ModelFields = ModelFields> {
   }
 
   /**
-   * 统计记录数量，支持与 findMany 一致的条件（等值与操作符），使用 SQL `COUNT(*)` 实现。
-   * `options` 可附加关键字过滤（与 search 一致的 OR LIKE 语义），用于搜索结果的分页总数。
+   * 统计记录数量，支持与 findMany 一致的条件（等值与操作符）。
+   *
+   * 默认用 `COUNT(*)` 统计行数；`options.column` 指定列时改用 `COUNT("col")`，
+   * 只统计该列非 NULL 的行——两者相减即可得到缺失数量，不需要额外的条件查询。
+   * `options.keyword` 可附加关键字过滤（与 search 一致的 OR LIKE 语义），用于搜索结果的分页总数。
    */
   count(where?: WhereInput<F>, options?: CountOptions<F>): number {
     const conditions = this.validateWhere(where, 'count()');
@@ -596,14 +713,15 @@ export class Model<F extends ModelFields = ModelFields> {
       clauses.push(`(${fields.map((field) => `"${field}" LIKE ?`).join(' OR ')})`);
       params.push(...fields.map(() => `%${kw}%`));
     }
-    let sql = `SELECT COUNT(*) AS total FROM "${this.tableName}"`;
+    const target = opts.column === undefined ? '*' : `"${opts.column}"`;
+    let sql = `SELECT COUNT(${target}) AS total FROM "${this.tableName}"`;
     if (clauses.length > 0) {
       sql += ` WHERE ${clauses.join(' AND ')}`;
     }
     const raw = this.execute('count()', (db) => db.prepare(sql).get(...params));
     const total = raw?.total;
     if (typeof total !== 'number' && typeof total !== 'bigint') {
-      throw new SqlModelError('COUNT(*) did not return an integer');
+      throw new SqlModelError('COUNT() did not return an integer');
     }
     return toSafeInteger(total);
   }
@@ -667,9 +785,9 @@ export class Model<F extends ModelFields = ModelFields> {
     return true;
   }
 
-  private selectById(id: number): ModelRow<F> | undefined {
+  private selectById(id: number, columns = '*'): ModelRow<F> | Record<string, SQLOutputValue> | undefined {
     const raw = this.execute('findById()', (db) =>
-      db.prepare(`SELECT * FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).get(id),
+      db.prepare(`SELECT ${columns} FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).get(id),
     );
     return raw === undefined ? undefined : this.toRow(raw);
   }
@@ -996,7 +1114,7 @@ export class Model<F extends ModelFields = ModelFields> {
     limit?: number;
     offset?: number;
   } {
-    const allowed = ['orderBy', 'order', 'limit', 'offset', ...extraKeys];
+    const allowed = ['orderBy', 'order', 'limit', 'offset', 'select', ...extraKeys];
     if (options === undefined) return { orderBy: PRIMARY_KEY, order: 'DESC' };
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new ValidationError(
@@ -1109,20 +1227,195 @@ export class Model<F extends ModelFields = ModelFields> {
     return [...seen];
   }
 
-  /** 校验 count 的可选关键字过滤选项。 */
+  /** 校验 count 的可选关键字过滤与列选项。 */
   private validateCountOptions(options: CountOptions<F> | undefined): CountOptions<F> {
     if (options === undefined) return {};
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new ValidationError(
-        `count() options must be an object with keyword/fields or undefined, received ${describeValue(options)}`,
+        `count() options must be an object with keyword/fields/column or undefined, received ${describeValue(options)}`,
       );
     }
     for (const key of Object.keys(options)) {
-      if (key !== 'keyword' && key !== 'fields') {
+      if (key !== 'keyword' && key !== 'fields' && key !== 'column') {
         throw new ValidationError(`Unknown option "${key}" in count() options`);
       }
     }
+    if (options.column !== undefined) {
+      const column = options.column;
+      if (typeof column !== 'string') {
+        throw new ValidationError(
+          `count() options.column must be a field declared on the model, received ${describeValue(column)}`,
+        );
+      }
+      if (!isManagedColumn(column) && this.fieldTypes.get(column) === undefined) {
+        throw this.unknownFieldError(column, 'count() options.column');
+      }
+    }
     return options;
+  }
+
+  /**
+   * 校验 `findPage` 的选项，返回规范化后的值。
+   * 与 `findMany` 的区别：`limit` 有默认值（20），且明确拒绝 `offset`。
+   */
+  private validatePageOptions(options: PageOptions<F> | undefined): {
+    orderBy: string;
+    order: 'ASC' | 'DESC';
+    limit: number;
+    after: Cursor | null;
+  } {
+    const allowed = ['orderBy', 'order', 'limit', 'after', 'select'];
+    if (options === undefined) {
+      return { orderBy: PRIMARY_KEY, order: 'DESC', limit: DEFAULT_PAGE_SIZE, after: null };
+    }
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      throw new ValidationError(
+        `findPage() options must be an object with ${allowed.join('/')} or undefined, received ${describeValue(options)}`,
+      );
+    }
+    for (const key of Object.keys(options)) {
+      if (!allowed.includes(key)) {
+        // offset 是最容易误用的一个：游标分页没有偏移量的概念，给了就得说清楚
+        if (key === 'offset') {
+          throw new ValidationError(
+            'findPage() does not accept options.offset: use options.after with the previous page.nextCursor instead',
+          );
+        }
+        throw new ValidationError(`Unknown option "${key}" in findPage() options`);
+      }
+    }
+
+    let orderBy: string = PRIMARY_KEY;
+    if (options.orderBy !== undefined) {
+      if (typeof options.orderBy !== 'string') {
+        throw new ValidationError(
+          `findPage() options.orderBy must be a field declared on the model (or "${PRIMARY_KEY}"), ` +
+            `received ${describeValue(options.orderBy)}`,
+        );
+      }
+      if (options.orderBy !== PRIMARY_KEY && this.fieldTypes.get(options.orderBy) === undefined) {
+        throw this.unknownFieldError(options.orderBy, 'findPage() options.orderBy');
+      }
+      orderBy = options.orderBy;
+    }
+
+    let order: 'ASC' | 'DESC' = 'DESC';
+    if (options.order !== undefined) {
+      if (options.order !== 'ASC' && options.order !== 'DESC') {
+        throw new ValidationError(
+          `findPage() options.order must be "ASC" or "DESC", received ${describeValue(options.order)}`,
+        );
+      }
+      order = options.order;
+    }
+
+    let limit = DEFAULT_PAGE_SIZE;
+    if (options.limit !== undefined) {
+      if (typeof options.limit !== 'number' || !Number.isSafeInteger(options.limit) || options.limit < 1) {
+        throw new ValidationError(
+          `findPage() options.limit must be a positive integer, received ${describeValue(options.limit)}`,
+        );
+      }
+      limit = options.limit;
+    }
+
+    return { orderBy, order, limit, after: this.validateCursor(options.after) };
+  }
+
+  /** 校验调用方回传的游标；null / undefined 都表示第一页。 */
+  private validateCursor(after: Cursor | null | undefined): Cursor | null {
+    if (after === undefined || after === null) return null;
+    if (typeof after !== 'object' || Array.isArray(after)) {
+      throw new ValidationError(
+        `findPage() options.after must be a cursor from a previous page, received ${describeValue(after)}`,
+      );
+    }
+    const { id, value } = after as Cursor;
+    assertId(id);
+    if (value !== null && typeof value !== 'string' && typeof value !== 'number') {
+      throw new ValidationError(
+        `findPage() options.after must be a cursor from a previous page, received ${describeValue(after)}`,
+      );
+    }
+    return { id, value };
+  }
+
+  /**
+   * 生成「严格排在游标之后」的 WHERE 片段。
+   *
+   * SQLite 把 NULL 视为最小值，因此 `ORDER BY col` 与 `ORDER BY col DESC` 里 NULL 分别在最前和最后：
+   * - 升序：`NULL 段 → 非 NULL 段`
+   * - 降序：`非 NULL 段 → NULL 段`
+   *
+   * 条件按「游标落在 NULL 段 / 非 NULL 段」分别展开：
+   * - 游标在 NULL 段：升序时剩余 = 同段更大主键 + 全部非 NULL 行；降序时只剩同段的主键
+   * - 游标在非 NULL 段：排序值更靠前者；同值时比主键；降序还要把后面整段 NULL 行带上
+   *
+   * 不用行值比较 `(a, b) > (?, ?)`：该写法遇到 NULL 恒为 NULL，会静默跳过整段 NULL 行。
+   */
+  private cursorCondition(
+    orderBy: string,
+    order: 'ASC' | 'DESC',
+    after: Cursor | null,
+  ): { sql?: string; params: SQLInputValue[] } {
+    if (after === null) return { params: [] };
+    const key = `"${orderBy}"`;
+    const pk = `"${PRIMARY_KEY}"`;
+    const cmp = order === 'ASC' ? '>' : '<';
+
+    if (orderBy === PRIMARY_KEY) {
+      return { sql: `${pk} ${cmp} ?`, params: [after.id] };
+    }
+    if (after.value === null) {
+      const sql =
+        order === 'ASC'
+          ? `(${key} IS NULL AND ${pk} > ?) OR ${key} IS NOT NULL`
+          : `(${key} IS NULL AND ${pk} < ?)`;
+      return { sql, params: [after.id] };
+    }
+    const rest = `(${key} ${cmp} ?) OR (${key} = ? AND ${pk} ${cmp} ?)`;
+    if (order === 'ASC') {
+      // 升序里 NULL 段在游标之前，已经取完了
+      return { sql: rest, params: [after.value, after.value, after.id] };
+    }
+    // 降序里 NULL 段排在所有非 NULL 值之后，越过游标后必然要包含它们
+    return { sql: `${rest} OR ${key} IS NULL`, params: [after.value, after.value, after.id] };
+  }
+
+  /**
+   * 把 `select` 编译成 SELECT 的列清单。
+   * 未指定时返回 `*`（行为与之前一致）；指定时必须是非空的已知列名数组。
+   * 列名来自模型声明或托管列白名单，其余一律拒绝，因此可以直接拼进 SQL。
+   */
+  private projection(select: readonly string[] | undefined, context: string): string {
+    if (select === undefined) return '*';
+    if (!Array.isArray(select)) {
+      throw new ValidationError(
+        `${context} options.select must be an array of field names, received ${describeValue(select)}`,
+      );
+    }
+    if (select.length === 0) {
+      throw new ValidationError(`${context} options.select must contain at least one column`);
+    }
+    const seen = new Set<string>();
+    for (const column of select) {
+      if (typeof column !== 'string') {
+        throw new ValidationError(
+          `${context} options.select must contain field names, received ${describeValue(column)}`,
+        );
+      }
+      // SQLite 列名大小写不敏感，但返回的行对象以 SQL 中的列名为键；
+      // 托管列按规范名输出，模型字段按声明时的写法输出，保证调用方拿到的键与请求一致
+      const canonical = isManagedColumn(column) ? reservedFieldName(column) ?? column : column;
+      if (seen.has(canonical)) {
+        throw new ValidationError(`Duplicate column in ${context} options.select`);
+      }
+      seen.add(canonical);
+      if (!isManagedColumn(canonical) && this.fieldTypes.get(canonical) === undefined) {
+        throw this.unknownFieldError(canonical, `${context} options.select`);
+      }
+    }
+    return [...seen].map((column) => `"${column}"`).join(', ');
   }
 
   /**

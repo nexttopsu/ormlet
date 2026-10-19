@@ -1,13 +1,18 @@
 import { afterEach, beforeEach, describe, test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import {
+  CheckConstraintError,
+  ConstraintError,
   Database,
   DatabaseClosedError,
+  ForeignKeyConstraintError,
+  NotNullConstraintError,
   SqlModelError,
   TransactionError,
+  UniqueConstraintError,
   ValidationError,
 } from '../src/index.js';
-import type { Model } from '../src/index.js';
+import type { Cursor, Model, ModelRow, Page, PageOptions } from '../src/index.js';
 
 // 传入故意非法的参数时绕过编译期检查，测试运行时校验
 const invalid = (value: unknown): never => value as never;
@@ -439,7 +444,6 @@ describe('upsert', () => {
     assert.throws(() => User.upsert({ name: 'a' }, { on: ['name'] }), SqlModelError);
     assert.equal(User.count(), 0);
   });
-
   test('rejects invalid input', () => {
     assert.throws(() => User.upsert(invalid({ unknownField: 1 })), ValidationError);
     assert.throws(() => User.upsert(invalid({ age: 'x' })), ValidationError);
@@ -458,5 +462,290 @@ describe('upsert', () => {
     assert.equal(M.count(), 3);
     assert.equal(M.findMany({ key: 'a' })[0]!.value, 10);
     db2.close();
+  });
+});
+
+describe('constraint errors', () => {
+  test('distinguishes primary key and unique conflicts', () => {
+    const db2 = new Database(':memory:');
+    const M = db2.model('M', { tableName: 'm', fields: { key: 'TEXT', value: 'INTEGER' } });
+    db2.exec('CREATE UNIQUE INDEX m_key ON m (key)');
+    const row = M.create({ key: 'a', value: 1 });
+
+    // 主键冲突（errcode 1555）：create 不接受 id，直接用 exec 触发
+    assert.throws(
+      () => db2.exec(`INSERT INTO m (id, key) VALUES (${row.id}, 'b')`),
+      UniqueConstraintError,
+    );
+    // 唯一索引冲突（errcode 2067）
+    assert.throws(() => M.create({ key: 'a', value: 2 }), UniqueConstraintError);
+    // 唯一约束错误也是 ConstraintError 与 SqlModelError，可统一捕获
+    assert.throws(() => M.create({ key: 'a', value: 2 }), ConstraintError);
+    assert.throws(() => M.create({ key: 'a', value: 2 }), SqlModelError);
+
+    const error = (() => {
+      try {
+        M.create({ key: 'a', value: 2 });
+      } catch (e) {
+        return e as UniqueConstraintError;
+      }
+      return undefined;
+    })();
+    assert.equal(error?.name, 'UniqueConstraintError');
+    assert.equal(error?.errcode, 2067);
+    // 错误消息不含表名 / 列名，不泄漏 schema
+    assert.equal(/m\.key|"m"/.test(error?.message ?? ''), false);
+    assert.equal((error as { cause?: unknown } | undefined)?.cause instanceof Error, true);
+    db2.close();
+  });
+
+  test('does not throw on a successful upsert that resolves the conflict', () => {
+    const db2 = new Database(':memory:');
+    const M = db2.model('M', { tableName: 'm', fields: { key: 'TEXT', value: 'INTEGER' } });
+    db2.exec('CREATE UNIQUE INDEX m_key ON m (key)');
+    M.create({ key: 'a', value: 1 });
+    assert.equal(M.upsert({ key: 'a', value: 9 }, { on: ['key'] }).value, 9);
+    // DO NOTHING 路径同样不抛
+    assert.equal(M.upsert({ key: 'a', value: 5 }, { on: ['key'], update: {} }).value, 9);
+    db2.close();
+  });
+
+  test('maps NOT NULL, CHECK and FOREIGN KEY violations', () => {
+    const db2 = new Database(':memory:');
+    const M = db2.model('M', { tableName: 'm', fields: { name: 'TEXT' } });
+    // 外部工具建的表带 NOT NULL 约束：模型不会写 NULL 到显式列，用 exec 直接触发
+    db2.exec('CREATE TABLE strict_t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL, c INTEGER CHECK (c > 0))');
+    assert.throws(() => db2.exec('INSERT INTO strict_t (v) VALUES (NULL)'), NotNullConstraintError);
+    assert.throws(() => db2.exec('INSERT INTO strict_t (v, c) VALUES (\'x\', -1)'), CheckConstraintError);
+
+    db2.exec('CREATE TABLE parent_t (id INTEGER PRIMARY KEY AUTOINCREMENT)');
+    db2.exec(
+      'CREATE TABLE child_t (id INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER REFERENCES parent_t(id))',
+    );
+    db2.exec('PRAGMA foreign_keys = ON');
+    assert.throws(() => db2.exec('INSERT INTO child_t (pid) VALUES (999)'), ForeignKeyConstraintError);
+
+    // 约束错误都要保持 SqlModelError 的继承关系，原有的统一捕获写法不受影响
+    assert.throws(() => db2.exec('INSERT INTO strict_t (v) VALUES (NULL)'), SqlModelError);
+    void M;
+    db2.close();
+  });
+});
+
+describe('select projection', () => {
+  test('returns only the requested columns', () => {
+    User.create({ name: 'a', age: 20, email: 'a@x' });
+    const rows = User.findMany(undefined, { select: ['id', 'name'] });
+    assert.equal(rows.length, 1);
+    assert.deepEqual(Object.keys(rows[0]!).sort(), ['id', 'name']);
+    assert.equal(rows[0]!.name, 'a');
+  });
+
+  test('works for findById and search', () => {
+    const created = User.create({ name: '张三', age: 30 });
+    const one = User.findById(created.id, { select: ['id', 'age'] });
+    assert.deepEqual(Object.keys(one!).sort(), ['age', 'id']);
+    assert.equal(one!.age, 30);
+
+    const found = User.search('张', { select: ['name'] });
+    assert.deepEqual(Object.keys(found[0]!), ['name']);
+  });
+
+  test('keeps conditions and ordering working with a projection', () => {
+    User.create({ name: 'a', age: 20 });
+    User.create({ name: 'b', age: 40 });
+    User.create({ name: 'c', age: 30 });
+    const rows = User.findMany({ age: { gte: 25 } }, { select: ['name'], orderBy: 'age', order: 'ASC' });
+    assert.deepEqual(
+      rows.map((row) => row.name),
+      ['c', 'b'],
+    );
+  });
+
+  test('accepts managed columns and canonicalizes their casing', () => {
+    User.create({ name: 'a' });
+    const rows = User.findMany(undefined, invalid({ select: ['ID', 'CREATEDAT'] }));
+    assert.deepEqual(Object.keys(rows[0]!).sort(), ['createdAt', 'id']);
+  });
+
+  test('omitting select keeps returning the full row', () => {
+    User.create({ name: 'a' });
+    const row = User.findMany(undefined)[0]!;
+    assert.deepEqual(Object.keys(row).sort(), ['age', 'createdAt', 'email', 'id', 'name', 'score', 'updatedAt']);
+  });
+
+  test('rejects invalid select', () => {
+    User.create({ name: 'a' });
+    assert.throws(() => User.findMany(undefined, invalid({ select: [] })), ValidationError);
+    assert.throws(() => User.findMany(undefined, invalid({ select: ['nickname'] })), ValidationError);
+    assert.throws(() => User.findMany(undefined, invalid({ select: ['id', 'id'] })), ValidationError);
+    assert.throws(() => User.findMany(undefined, invalid({ select: 'name' })), ValidationError);
+    assert.throws(() => User.findById(1, invalid({ select: ['nickname'] })), ValidationError);
+    assert.throws(() => User.search('a', invalid({ select: ['unknown'] })), ValidationError);
+    // 字段名同样是拼接进 SQL 的，注入写法必须被拒绝
+    assert.throws(
+      () => User.findMany(undefined, invalid({ select: ['name FROM users; DROP TABLE users'] })),
+      ValidationError,
+    );
+  });
+});
+
+describe('findPage cursor pagination', () => {
+  const insertMany = (count: number) => {
+    const rows = Array.from({ length: count }, (_, i) => ({ name: `u${i}`, age: i % 7, email: null }));
+    User.createMany(rows);
+  };
+
+  /** 按游标翻完所有页，返回按页展开的 id 列表。 */
+  const drain = (options: PageOptions<UserFields>) => {
+    const ids: number[] = [];
+    let cursor: Cursor | null = null;
+    let pages = 0;
+    for (;;) {
+      // drain 只跑非投影场景，显式把参数类型收窄为「不带 select」的形态
+      const query: PageOptions<UserFields> & { select?: never } = { ...options, after: cursor };
+      const page: Page<ModelRow<UserFields>> = User.findPage(query);
+      ids.push(...page.items.map((row) => row.id));
+      pages += 1;
+      if (!page.hasMore) break;
+      cursor = page.nextCursor;
+      assert.ok(pages < 1000, 'pagination did not terminate');
+    }
+    return { ids, pages };
+  };
+
+  test('walks the whole table without gaps or duplicates', () => {
+    insertMany(53);
+    for (const order of ['ASC', 'DESC'] as const) {
+      const { ids } = drain({ limit: 10, order });
+      assert.equal(ids.length, 53);
+      assert.equal(new Set(ids).size, 53);
+      const expected = User.findMany(undefined, { orderBy: 'id', order, limit: 53 }).map((row) => row.id);
+      assert.deepEqual(ids, expected);
+    }
+  });
+
+  test('respects orderBy on a duplicated column', () => {
+    insertMany(53);
+    const { ids } = drain({ orderBy: 'age', order: 'ASC', limit: 7 });
+    assert.equal(ids.length, 53);
+    // 与一次性查询的顺序必须完全一致（同值时按 id 打破平局）
+    const expected = User.findMany(undefined, { orderBy: 'age', order: 'ASC', limit: 53 }).map((row) => row.id);
+    assert.deepEqual(ids, expected);
+  });
+
+  test('includes NULL rows when ordering by a nullable column', () => {
+    // 5 行有值、4 行为 NULL：行值比较 (a,b) > (x,y) 会静默丢掉整段 NULL，这里必须不丢
+    User.createMany(Array.from({ length: 5 }, (_, i) => ({ name: `n${i}`, age: i + 1 })));
+    User.createMany(Array.from({ length: 4 }, (_, i) => ({ name: `z${i}`, age: null })));
+    assert.equal(User.count({ age: { isNull: true } }), 4);
+
+    // 对照基准：按 (age, id) 同向排序的完整顺序，NULL 按 SQLite 语义排在最前（ASC）/ 最后（DESC）
+    const expectedOrder = (order: 'ASC' | 'DESC') =>
+      db
+        .prepare(`SELECT id FROM users ORDER BY age ${order}, id ${order}`)
+        .all()
+        .map((row) => Number(row.id));
+
+    for (const order of ['ASC', 'DESC'] as const) {
+      const { ids } = drain({ orderBy: 'age', order, limit: 2 });
+      assert.equal(ids.length, 9, `NULL rows must not be skipped (${order})`);
+      assert.deepEqual(ids, expectedOrder(order), `page order must match a full scan (${order})`);
+    }
+  });
+
+  test('reports hasMore and nextCursor consistently', () => {
+    insertMany(20);
+    const first = User.findPage({ limit: 20 });
+    assert.equal(first.items.length, 20);
+    assert.equal(first.hasMore, false);
+    assert.equal(first.nextCursor, null);
+
+    const smaller = User.findPage({ limit: 19 });
+    assert.equal(smaller.items.length, 19);
+    assert.equal(smaller.hasMore, true);
+    assert.equal(smaller.nextCursor?.id, smaller.items[18]!.id);
+  });
+
+  test('defaults to 20 rows per page', () => {
+    insertMany(25);
+    assert.equal(User.findPage().items.length, 20);
+  });
+
+  test('supports select and keeps the cursor columns available', () => {
+    insertMany(5);
+    const page = User.findPage({ orderBy: 'age', order: 'ASC', limit: 2, select: ['name'] });
+    // 调用方只要 name，但内部仍按 age + id 生成游标，因此这两个列会被补进结果
+    assert.deepEqual(Object.keys(page.items[0]!).sort(), ['age', 'id', 'name']);
+    assert.equal(page.hasMore, true);
+    const next = User.findPage({ orderBy: 'age', order: 'ASC', limit: 2, select: ['name'], after: page.nextCursor });
+    assert.equal(next.items.length, 2);
+    // 两页之间没有重叠（select 的结果里 id 被自动补上，见上一条断言）
+    const firstIds = page.items.map((row) => (row as unknown as { id: number }).id);
+    const nextIds = next.items.map((row) => (row as unknown as { id: number }).id);
+    assert.equal(firstIds.filter((id) => nextIds.includes(id)).length, 0);
+  });
+
+  test('stays stable when rows are inserted between pages', () => {
+    insertMany(10);
+    const first = User.findPage({ limit: 5, order: 'DESC' });
+    // 插入更新的行（id 更大，会排在 DESC 的最前面）
+    User.create({ name: 'late' });
+    const second = User.findPage({ limit: 5, order: 'DESC', after: first.nextCursor });
+    // OFFSET 分页在这种情况下会把已看过的行再返回一次
+    const overlap = first.items.filter((a) => second.items.some((b) => a.id === b.id));
+    assert.equal(overlap.length, 0);
+  });
+
+  test('rejects invalid page options', () => {
+    insertMany(3);
+    assert.throws(() => User.findPage(invalid({ offset: 10 })), ValidationError);
+    assert.throws(() => User.findPage(invalid({ limit: 0 })), ValidationError);
+    assert.throws(() => User.findPage(invalid({ orderBy: 'nickname' })), ValidationError);
+    assert.throws(() => User.findPage(invalid({ order: 'asc' })), ValidationError);
+    assert.throws(() => User.findPage(invalid({ after: { id: 0, value: null } })), ValidationError);
+    assert.throws(() => User.findPage(invalid({ after: 'abc' })), ValidationError);
+    assert.throws(() => User.findPage(invalid({ after: { id: 1, value: {} } })), ValidationError);
+    assert.throws(() => User.findPage(invalid({ unknown: 1 })), ValidationError);
+  });
+});
+
+describe('count by column', () => {
+  test('counts non-null values of a column', () => {
+    User.createMany([
+      { name: 'a', email: 'a@x' },
+      { name: 'b', email: null },
+      { name: 'c', email: 'c@x' },
+    ]);
+    assert.equal(User.count(), 3);
+    assert.equal(User.count(undefined, { column: 'email' }), 2);
+    // 与 isNull 条件互补
+    assert.equal(User.count({ email: { isNull: true } }), 1);
+    assert.equal(User.count(undefined, { column: 'email' }) + User.count({ email: { isNull: true } }), 3);
+  });
+
+  test('combines with where and keyword', () => {
+    User.createMany([
+      { name: 'alpha', age: 10, email: 'a@x' },
+      { name: 'alpine', age: 20, email: null },
+      { name: 'beta', age: 30, email: 'b@x' },
+    ]);
+    assert.equal(User.count(undefined, { column: 'email', keyword: 'al' }), 1);
+    assert.equal(User.count({ age: { gte: 20 } }, { column: 'email' }), 1);
+  });
+
+  test('accepts managed columns', () => {
+    User.create({ name: 'a' });
+    assert.equal(User.count(undefined, { column: 'id' }), 1);
+    assert.equal(User.count(undefined, { column: 'createdAt' }), 1);
+  });
+
+  test('rejects an unknown column', () => {
+    assert.throws(() => User.count(undefined, invalid({ column: 'nickname' })), ValidationError);
+    assert.throws(() => User.count(undefined, invalid({ column: 123 })), ValidationError);
+    assert.throws(
+      () => User.count(undefined, invalid({ column: 'id; DROP TABLE users' })),
+      ValidationError,
+    );
   });
 });

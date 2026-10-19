@@ -69,6 +69,15 @@ export function reservedFieldName(name: string): string | null {
   return null;
 }
 
+/**
+ * 是否为自动管理的列（id / createdAt / updatedAt）。
+ * 与 `reservedFieldName` 的区别：这里只回答「是不是托管列」，不做名称规范化，
+ * 用于允许这些列出现在 `select` / `orderBy` 这类**只读**位置。
+ */
+export function isManagedColumn(name: string): boolean {
+  return reservedFieldName(name) !== null;
+}
+
 export function assertId(id: unknown): number {
   if (typeof id !== 'number' || !Number.isSafeInteger(id) || id < 1) {
     throw new ValidationError(`id must be a positive safe integer, received ${describeValue(id)}`);

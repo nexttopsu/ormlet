@@ -3,6 +3,7 @@ export { Model } from './model.js';
 export type {
   CountOptions,
   CreateManyOptions,
+  Cursor,
   DatabaseOptions,
   FieldCondition,
   FieldValue,
@@ -13,8 +14,13 @@ export type {
   ModelFields,
   ModelRow,
   MutationResult,
+  Page,
+  PageOptions,
+  ProjectedRow,
   QueryOptions,
   SearchOptions,
+  SelectableName,
+  SelectedRow,
   TextFieldNames,
   UpdateManyOptions,
   UpsertOptions,
@@ -22,11 +28,16 @@ export type {
   WhereOperator,
 } from './types.js';
 export {
+  CheckConstraintError,
+  ConstraintError,
   DatabaseClosedError,
+  ForeignKeyConstraintError,
   InvalidModelError,
   LockTimeoutError,
+  NotNullConstraintError,
   SqlModelError,
   TransactionError,
+  UniqueConstraintError,
   ValidationError,
 } from './errors.js';
 export { isLockConflict, translateSqliteError } from './sql-error.js';

@@ -180,3 +180,28 @@ const mutated = modelTyped.updateMany({ age: { gt: 0 } }, { score: 1 });
 const removedMany = modelTyped.deleteMany({ age: { isNull: true } });
 const changed: number = mutated.changes + removedMany.changes;
 void changed;
+
+// ---- select 字段投影 ----
+
+const projected = modelTyped.findMany(undefined, { select: ['id', 'name'] });
+// 投影后的行只剩请求的列，可以直接使用
+const projectedId: number = projected[0]!.id;
+const projectedName: string | null = projected[0]!.name;
+// @ts-expect-error 未请求的列不在返回类型里
+projected[0]!.age;
+void projectedId;
+void projectedName;
+
+// 托管列同样可以投影
+const withTimestamps = modelTyped.findById(1, { select: ['id', 'createdAt'] });
+const projectedCreatedAt: string | null = withTimestamps?.createdAt ?? null;
+void projectedCreatedAt;
+
+// 不传 select 时仍返回完整行
+const fullRows: ModelRow<UserFields>[] = modelTyped.findMany();
+void fullRows;
+
+// @ts-expect-error select 中的未知字段
+modelTyped.findMany(undefined, { select: ['nickname'] });
+// @ts-expect-error select 只接受列名，不接受任意字符串
+modelTyped.search('x', { select: ['name; DROP TABLE users'] });

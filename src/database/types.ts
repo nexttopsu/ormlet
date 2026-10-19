@@ -127,6 +127,38 @@ export type WhereInput<F extends ModelFields> = {
 };
 
 /**
+ * `select` 允许的列名：模型声明的字段，或自动管理的 `id` / `createdAt` / `updatedAt`。
+ */
+export type SelectableName<F extends ModelFields> = (keyof F & string) | 'id' | 'createdAt' | 'updatedAt';
+
+/**
+ * 根据 `select` 推导出的行类型：只保留请求的列。
+ * 不传 `select` 时返回完整的 `ModelRow<F>`。
+ *
+ * @example
+ * const rows = User.findMany(undefined, { select: ['id', 'name'] });
+ * // rows: Array<{ id: number; name: string | null }>
+ */
+export type SelectedRow<F extends ModelFields, K extends SelectableName<F>> = {
+  [P in K]: ModelRow<F>[P & keyof ModelRow<F>];
+};
+
+/**
+ * 投影结果的行类型：`K` 为 `undefined`（未指定 select）时是完整行。
+ */
+export type ProjectedRow<F extends ModelFields, K extends SelectableName<F> | undefined> = K extends
+  | undefined
+  | void
+  ? ModelRow<F>
+  : SelectedRow<F, Extract<K, SelectableName<F>>>;
+
+/**
+ * 从选项类型上读出 `select` 的元素类型；未指定时为 `undefined`。
+ * 用于让返回类型跟随「这一次调用实际请求了哪些列」自动收窄。
+ */
+export type SelectOf<O> = O extends { select: readonly (infer C)[] } ? C : undefined;
+
+/**
  * `findMany` 的排序与分页选项（全部可选）。
  */
 export interface QueryOptions<F extends ModelFields> {
@@ -139,12 +171,64 @@ export interface QueryOptions<F extends ModelFields> {
   limit?: number;
   /** 跳过的记录数，必须是非负整数，且必须与 `limit` 一起使用 */
   offset?: number;
+  /**
+   * 只查询指定列（字段投影），对应 SQL 的 `SELECT "a", "b"`。
+   *
+   * 主要用途是避开大字段：`SELECT *` 会把 BLOB / 长 TEXT 一并读出来并复制进 JS 堆，
+   * 列表页通常只需要少数字段。列名必须是模型声明的字段或托管列（`id` / `createdAt` / `updatedAt`），
+   * 返回类型会相应收窄。
+   *
+   * 省略时行为不变（返回完整行）。
+   */
+  select?: readonly SelectableName<F>[];
 }
 
 /** 模型声明中类型为 TEXT 的字段名（用于 `search` 的字段选项）。 */
 export type TextFieldNames<F extends ModelFields> = {
   [K in keyof F]: F[K] extends 'TEXT' ? K : never;
 }[keyof F];
+
+/**
+ * 游标分页的游标：由「排序字段值 + 主键」组成，因此可以唯一定位某一行。
+ * 作为返回值给出时视为不透明，回传给 `after` 即可，不需要自己构造。
+ */
+export interface Cursor {
+  /** 排序字段的取值（排序字段是 `id` 时为 null，此时只用主键比较） */
+  value: string | number | null;
+  /** 该行的主键，用于在同值时打破平局 */
+  id: number;
+}
+
+/**
+ * `findPage` 的选项：排序字段、每页条数、上一页的游标。
+ *
+ * 与 `findMany` 的 `limit` / `offset` 相比，游标分页不随页码变慢：
+ * `OFFSET 100000` 需要先跳过 10 万行，而游标条件可以直接从索引上定位起点。
+ */
+export interface PageOptions<F extends ModelFields> {
+  /** 排序字段：模型声明的字段，或主键 `id`；默认 `id` */
+  orderBy?: (keyof F & string) | 'id';
+  /** 排序方向，默认 `DESC` */
+  order?: 'ASC' | 'DESC';
+  /** 每页条数，必须是正整数，默认 20 */
+  limit?: number;
+  /**
+   * 上一页返回的 `nextCursor`；不传（或传 null）表示取第一页。
+   */
+  after?: Cursor | null;
+}
+
+/**
+ * `findPage` 的返回值。
+ */
+export interface Page<R> {
+  /** 本页数据 */
+  items: R[];
+  /** 下一页的游标；`hasMore` 为 false 时为 null */
+  nextCursor: Cursor | null;
+  /** 是否还有下一页 */
+  hasMore: boolean;
+}
 
 /**
  * `search` 的选项：参与搜索的 TEXT 字段 + `findMany` 的排序与分页。
@@ -155,13 +239,20 @@ export interface SearchOptions<F extends ModelFields> extends QueryOptions<F> {
 }
 
 /**
- * `count` 的可选关键字过滤（用于搜索结果的分页总数）。
+ * `count` 的选项。
  */
 export interface CountOptions<F extends ModelFields> {
   /** 关键字：对 `fields`（默认全部 TEXT 字段）做 OR LIKE 匹配，与 `where` 等值条件为 AND 关系 */
   keyword?: string;
   /** 参与关键字搜索的 TEXT 字段；缺省为模型声明的全部 TEXT 字段 */
   fields?: Array<TextFieldNames<F>>;
+  /**
+   * 改为统计该列的非 NULL 行数（SQL 的 `COUNT(col)`），省略时为 `COUNT(*)`。
+   *
+   * 与 `count({ col: { isNull: true } })` 的区别：这里不叠加任何条件，
+   * 只回答「这一列有多少行填了值」，结果可以直接与 `count()` 相减得到缺失数。
+   */
+  column?: SelectableName<F>;
 }
 
 /**

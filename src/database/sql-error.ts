@@ -1,4 +1,11 @@
-import { LockTimeoutError, SqlModelError } from './errors.js';
+import {
+  CheckConstraintError,
+  ForeignKeyConstraintError,
+  LockTimeoutError,
+  NotNullConstraintError,
+  SqlModelError,
+  UniqueConstraintError,
+} from './errors.js';
 
 /**
  * SQLite 的锁相关 errcode 与 errstr。
@@ -53,8 +60,41 @@ export function isReadOnlyDatabaseError(error: unknown): boolean {
 }
 
 /**
+ * SQLITE_CONSTRAINT 扩展 errcode → 具体错误类型。
+ *
+ * SQLite 的扩展码是 `19 | (n << 8)`，不同约束互相独立，因此**必须**按完整 errcode 精确匹配，
+ * 不能用 `& 0xff` 归并——那样会把主键冲突、外键冲突混为一种。
+ * 这些值取自 sqlite3.h，跨版本稳定。
+ */
+const CONSTRAINT_ERRORS: Readonly<Record<number, typeof UniqueConstraintError>> = {
+  275: CheckConstraintError, // SQLITE_CONSTRAINT_CHECK
+  787: ForeignKeyConstraintError, // SQLITE_CONSTRAINT_FOREIGNKEY
+  1299: NotNullConstraintError, // SQLITE_CONSTRAINT_NOTNULL
+  1555: UniqueConstraintError, // SQLITE_CONSTRAINT_PRIMARYKEY
+  2067: UniqueConstraintError, // SQLITE_CONSTRAINT_UNIQUE
+};
+
+/** 从错误文本里识别约束类型，用于 errcode 缺失或为裸 19 时的兜底。 */
+function constraintFromMessage(text: string): typeof UniqueConstraintError | undefined {
+  if (/UNIQUE constraint failed/i.test(text)) return UniqueConstraintError;
+  if (/NOT NULL constraint failed/i.test(text)) return NotNullConstraintError;
+  if (/FOREIGN KEY constraint failed/i.test(text)) return ForeignKeyConstraintError;
+  if (/CHECK constraint failed/i.test(text)) return CheckConstraintError;
+  return undefined;
+}
+
+/** 取错误的最可读文本（优先 message，其次 errstr）。 */
+function errorText(error: unknown): string {
+  const like = asSqliteErrorLike(error);
+  if (typeof like?.message === 'string' && like.message.length > 0) return like.message;
+  if (typeof like?.errstr === 'string' && like.errstr.length > 0) return like.errstr;
+  return '';
+}
+
+/**
  * 把底层 SQLite 错误收敛为本库的错误类型：
  * - 锁冲突 → LockTimeoutError（可区分、可重试）；
+ * - 约束冲突 → ConstraintError 的具体子类（Unique / NotNull / ForeignKey / Check）；
  * - 其他 SQLite 错误 → SqlModelError，并保留原始错误作为 `cause`，方便排查。
  * 已经是本库错误类型的直接透传，避免二次包装。
  */
@@ -63,12 +103,7 @@ export function translateSqliteError(error: unknown, context: string): never {
 
   const like = asSqliteErrorLike(error);
   const errcode = typeof like?.errcode === 'number' ? like.errcode : undefined;
-  const raw =
-    typeof like?.message === 'string' && like.message.length > 0
-      ? like.message
-      : typeof like?.errstr === 'string' && like.errstr.length > 0
-        ? like.errstr
-        : String(error);
+  const text = errorText(error);
   // 原始消息可能包含 SQL 语句片段（含表名、列名），因此不做原样透传
   const detail = errcode === undefined ? 'unknown SQLite error' : `SQLite error ${errcode}`;
 
@@ -79,5 +114,23 @@ export function translateSqliteError(error: unknown, context: string): never {
       errcode,
     );
   }
+
+  const Constraint = (errcode !== undefined ? CONSTRAINT_ERRORS[errcode] : undefined) ?? constraintFromMessage(text);
+  if (Constraint !== undefined) {
+    throw new Constraint(`${context} failed: ${describeConstraint(Constraint)} (${detail})`, errcode, {
+      cause: error,
+    });
+  }
+
   throw new SqlModelError(`${context} failed: ${detail}`, { cause: error });
+}
+
+/** 约束错误的一句人话说明；不包含 SQL 原文，只说明违反了哪类约束。 */
+function describeConstraint(Constraint: typeof UniqueConstraintError): string {
+  if (Constraint === UniqueConstraintError) {
+    return 'a row with the same primary key or unique value already exists';
+  }
+  if (Constraint === NotNullConstraintError) return 'a required column was left empty';
+  if (Constraint === ForeignKeyConstraintError) return 'a foreign key refers to a row that does not exist';
+  return 'a column value does not satisfy a CHECK constraint';
 }

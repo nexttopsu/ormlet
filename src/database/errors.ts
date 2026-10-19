@@ -45,3 +45,41 @@ export class LockTimeoutError extends SqlModelError {
     this.errcode = errcode;
   }
 }
+
+/**
+ * 约束冲突的基类（SQLITE_CONSTRAINT 系列）。
+ * 捕获它即可统一处理所有「数据本身不满足表约束」的错误。
+ */
+export class ConstraintError extends SqlModelError {
+  /** 原始 errcode（如 1555 主键冲突、2067 唯一约束冲突） */
+  readonly errcode: number | undefined;
+
+  constructor(message: string, errcode?: number, options?: { cause?: unknown }) {
+    super(message, options);
+    this.errcode = errcode;
+  }
+}
+
+/**
+ * 违反唯一约束：主键或唯一索引上已存在相同值。
+ *
+ * 与 `SqlModelError` 分开，调用方可以据此实现「冲突则改为更新」而无需匹配错误文本：
+ * ```typescript
+ * try {
+ *   User.create({ email });
+ * } catch (error) {
+ *   if (error instanceof UniqueConstraintError) User.update(...);
+ *   else throw error;
+ * }
+ * ```
+ */
+export class UniqueConstraintError extends ConstraintError {}
+
+/** 违反 NOT NULL 约束：必填列为空。 */
+export class NotNullConstraintError extends ConstraintError {}
+
+/** 违反外键约束（需先 `PRAGMA foreign_keys = ON` 才会生效）。 */
+export class ForeignKeyConstraintError extends ConstraintError {}
+
+/** 违反 CHECK 约束：列值不满足表定义中的检查表达式。 */
+export class CheckConstraintError extends ConstraintError {}

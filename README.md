@@ -38,6 +38,9 @@ db.close();
 - **条件查询**：等值 + 范围（`gt` / `gte` / `lt` / `lte`）、集合（`in`）、区间（`between`）、判空（`isNull`），编译期校验字段与值类型。
 - **事务与批量写入**：`db.transaction()` 提供 `BEGIN IMMEDIATE` 事务；`createMany` / `upsert` / `upsertMany` / `updateMany` / `deleteMany` 在一个事务内批量执行，比逐条写入快两个数量级。
 - **排序与分页**：`findMany` 支持 `orderBy` / `order` 自定义排序与 `limit` / `offset` 分页，配合 `count()` 即可组装分页元信息。
+- **游标分页**：`findPage()` 用 `(orderBy, id)` 游标定位，深分页不退化（实测 5 万行时第 1251 页 OFFSET 80ms → 游标 7.4ms），翻页期间插入新行也不会重复或漏行。
+- **字段投影**：`select` 只查询需要的列，避免 `SELECT *` 把 BLOB / 长 TEXT 一并读进内存，返回类型自动收窄。
+- **约束错误细分**：唯一 / 主键 / NOT NULL / 外键 / CHECK 冲突分别抛 `UniqueConstraintError` 等具体类型，不必再匹配错误文本。
 - **关键字搜索**：`search()` 对 TEXT 字段做 OR LIKE 子串匹配（ASCII 大小写不敏感），支持指定字段与排序分页；`count()` 可带关键字统计搜索总数。
 - **字段同步与删除**：模型新增字段后重新打开数据库即自动补列（`syncFields`）；多余的列可手动删除（`deleteField`，仅允许删除模型未声明的字段，防止误删）。
 - **共享连接**：一个 `Database` 实例统一管理连接，多个模型共享，`close()` 后所有操作明确报错。
@@ -283,6 +286,7 @@ const users = User.findMany({
 | `order` | `'ASC' \| 'DESC'` | 排序方向，默认 `DESC` |
 | `limit` | `number` | 返回的最大记录数，必须是正整数 |
 | `offset` | `number` | 跳过的记录数，必须是非负整数，且必须与 `limit` 一起使用 |
+| `select` | 列名数组 | 只查询指定列（字段投影）；返回类型收窄为这些列 |
 
 ```typescript
 // 按年龄升序取第 3 页（每页 10 条）
@@ -301,6 +305,51 @@ const totalPages = Math.ceil(total / pageSize);
 ```
 
 非法选项都会抛 `ValidationError`：未知排序字段（含注入尝试）、非法方向（如 `'asc'`、`'RANDOM()'`）、非正整数 `limit`、无 `limit` 的 `offset`，以及未知选项键（如把 `limit` 拼写错——避免被静默忽略后意外加载全表）。`limit` / `offset` 同样通过参数绑定传入。
+
+#### 字段投影（`select`）
+
+`SELECT *` 会把 BLOB、长 TEXT 也读出来并复制进 JS 堆，列表页通常只需要少数字段：
+
+```typescript
+const rows = User.findMany({ age: { gte: 18 } }, { select: ['id', 'name'] });
+// rows 的类型是 Array<{ id: number; name: string | null }>，age 不在其中
+```
+
+- 返回值类型随 `select` 自动收窄（`findById` / `search` / `findPage` 同样支持）；
+- 允许托管列 `id` / `createdAt` / `updatedAt`，且大小写会被规范化为声明时的写法；
+- 未知列、重复列、空数组、非数组都会抛 `ValidationError`——列名同样是拼接进 SQL 的，走的是同一套白名单。
+
+#### `findPage(options?): Page<ModelRow<F>>`
+
+游标（keyset）分页。用「排序字段值 + 主键」组成的游标定位下一页，**不使用 `OFFSET`**。
+
+| 选项 | 类型 | 说明 |
+| --- | --- | --- |
+| `orderBy` | 模型声明的字段名 \| `'id'` | 排序字段，默认 `id` |
+| `order` | `'ASC' \| 'DESC'` | 排序方向，默认 `DESC` |
+| `limit` | `number` | 每页条数，默认 `20`，必须是正整数 |
+| `after` | `Cursor \| null` | 上一页返回的 `nextCursor`；不传或传 `null` 表示第一页 |
+| `select` | 列名数组 | 字段投影；排序字段与主键会被自动补进结果（否则无法生成游标） |
+
+返回 `{ items, nextCursor, hasMore }`。
+
+```typescript
+let cursor = null;
+for (;;) {
+  const page = User.findPage({ orderBy: 'age', order: 'ASC', limit: 20, after: cursor });
+  render(page.items);
+  if (!page.hasMore) break;
+  cursor = page.nextCursor;
+}
+```
+
+为什么不用 `OFFSET`：
+
+- **深分页不退化**。`OFFSET 25000` 要先扫过 2.5 万行再丢弃，游标条件可以直接从索引定位起点。5 万行实测（`.workbuddy/stress/bench-page.ts`）：第 1251 页 `OFFSET` **80.5ms**，同位置游标 **7.4ms**，且游标耗时与页码无关；
+- **翻页期间插入新行不会错位**。`OFFSET` 分页在有新行插入时会把已看过的行再返回一次，游标不会；
+- **排序确定**。排序字段有重复值时用主键 `id` 作为次级键，顺序稳定；
+- **NULL 行不丢**。SQLite 把 NULL 当最小值，升序在最前、降序在最后；实现里按 NULL 段单独分支，不能用行值比较 `(a, b) > (x, y)`（该写法遇到 NULL 恒为 NULL，会静默跳过整段 NULL 行）；
+- 不接受 `options.offset`（与游标语义冲突），传了会明确报错。
 
 #### `search(keyword, options?): ModelRow<F>[]`
 
@@ -327,14 +376,21 @@ const total = User.count(undefined, { keyword: '张三', fields: ['name', 'email
 
 #### `count(where?, options?): number`
 
-返回记录数量，支持与 `findMany` 完全一致的条件（等值与全部操作符），使用 SQL `COUNT(*)` 实现。
+返回记录数量，支持与 `findMany` 完全一致的条件（等值与全部操作符）。
 
-`options` 可选关键字过滤（用于搜索结果的分页总数）：
+`options`：
 
 | 选项 | 类型 | 说明 |
 | --- | --- | --- |
 | `keyword` | `string` | 对 `fields` 的 TEXT 字段做 OR LIKE 匹配（语义同 `search`），与 `where` 等值条件为 AND 关系 |
 | `fields` | TEXT 字段名数组 | 参与关键字搜索的字段，缺省为全部 TEXT 字段；必须与 `keyword` 一起使用 |
+| `column` | 列名 | 改用 `COUNT(col)` 统计该列**非 NULL** 的行数；省略时是 `COUNT(*)` |
+
+```typescript
+// 有邮箱 / 没邮箱各多少（两者相加等于总行数）
+const filled = User.count(undefined, { column: 'email' });
+const missing = User.count() - filled;
+```
 
 #### `update(id, data): boolean`
 
@@ -490,9 +546,15 @@ const updated = User.findById(user.id);
 | `WhereInput<F>` | 查询条件类型：字段 → 标量或 `FieldCondition`（操作符对象） |
 | `FieldCondition<T>` | 单个字段的条件：标量 / `null` / 操作符对象（`eq`、`ne`、`gt`、`gte`、`lt`、`lte`、`in`、`between`、`isNull`） |
 | `WhereOperator` | 操作符名称联合类型 |
-| `QueryOptions<F>` | `findMany` 的排序与分页选项：`orderBy` / `order` / `limit` / `offset` |
+| `QueryOptions<F>` | `findMany` 的排序与分页选项：`orderBy` / `order` / `limit` / `offset` / `select` |
 | `SearchOptions<F>` | `search` 的选项：`fields`（参与搜索的 TEXT 字段）+ `QueryOptions` |
-| `CountOptions<F>` | `count` 的关键字过滤选项：`keyword` / `fields` |
+| `CountOptions<F>` | `count` 的选项：`keyword` / `fields` / `column`（按列统计非 NULL 行） |
+| `SelectableName<F>` | 可投影的列名：模型字段 + `id` / `createdAt` / `updatedAt` |
+| `SelectedRow<F, K>` | 投影后的行类型：只保留 `K` 中的列 |
+| `ProjectedRow<F, K>` | 投影结果：`K` 为 `undefined` 时是完整 `ModelRow<F>` |
+| `Cursor` | 游标：`{ value, id }`，由上一页的 `nextCursor` 给出，原样回传即可 |
+| `PageOptions<F>` | `findPage` 的选项：`orderBy` / `order` / `limit` / `after` / `select` |
+| `Page<R>` | `findPage` 的返回值：`items` / `nextCursor` / `hasMore` |
 | `CreateManyOptions` | `createMany` 的选项：`chunkSize` / `strictFields` |
 | `UpsertOptions<F>` | `upsert` / `upsertMany` 的选项：`on` / `update` |
 | `UpdateManyOptions` | `updateMany` / `deleteMany` 的选项：`chunkSize` |
@@ -531,16 +593,23 @@ User.findMany({ age: '25' });        // 错误：查询条件类型不匹配
 | `ValidationError` | CRUD 参数非法：未知字段、值类型不匹配、空数据、非法 id、未知操作符、查询条件传 null 等 |
 | `TransactionError` | 事务使用不当：嵌套调用 `db.transaction()`、在事务中关闭数据库 |
 | `LockTimeoutError` | 数据库被其他连接锁定，且在 `busyTimeout` 内未能取得锁（`errcode` 保留 SQLITE_BUSY / SQLITE_LOCKED） |
+| `ConstraintError` | 约束冲突基类，所有具体约束错误都继承它 |
+| `UniqueConstraintError` | 违反唯一约束：主键或唯一索引上已有相同值（`errcode` 1555 / 2067） |
+| `NotNullConstraintError` | 必填列为空（`errcode` 1299） |
+| `ForeignKeyConstraintError` | 外键指向不存在的行（需先 `PRAGMA foreign_keys = ON`，`errcode` 787） |
+| `CheckConstraintError` | 列值不满足 CHECK 约束（`errcode` 275） |
 
-底层 SQLite 错误不会原样冒泡：锁冲突统一抛 `LockTimeoutError`，其余包装为 `SqlModelError` 并保留 `cause`。因此可以这样区分并重试：
+底层 SQLite 错误不会原样冒泡：锁冲突统一抛 `LockTimeoutError`，约束冲突按类型细分，其余包装为 `SqlModelError` 并保留 `cause`。因此可以这样区分并重试：
 
 ```typescript
-import { LockTimeoutError, isLockConflict } from 'ormlet';
+import { LockTimeoutError, UniqueConstraintError, isLockConflict } from 'ormlet';
 
 try {
   User.create({ name: '张三' });
 } catch (error) {
-  if (error instanceof LockTimeoutError) {
+  if (error instanceof UniqueConstraintError) {
+    // 已存在：改为更新，或提示用户
+  } else if (error instanceof LockTimeoutError) {
     // 锁竞争：稍后重试，或调大 busyTimeout
   } else if (isLockConflict(error)) {
     // 也能识别被其他层包装过的锁错误
@@ -577,12 +646,13 @@ npm run stress      # 压力测试：多进程初始化竞态 / 吞吐 / 20 万�
 
 压力测试可用 `npm run stress -- scale soak` 只跑指定场景，报告写入 `.workbuddy/stress/`（已加入 `.gitignore`）。
 
-测试覆盖：内存数据库、自动建表、全部 CRUD、条件查询、排序与分页（含按主键排序）、关键字搜索（大小写、字段限制、通配符、注入防护）、参数绑定与特殊字符、多模型共享连接、文件持久化、字段同步与删除、自动时间戳（含旧表迁移）、关闭后拒绝操作、事务（提交 / 回滚 / 嵌套拒绝）、条件操作符（范围 / 集合 / 区间 / 判空 / 超长 IN 拆分）、批量写入（分批、原子性、字段集合校验）、upsert、并发首次打开只读恢复、非法参数拒绝、编译期类型检查等 143 个用例，全部可重复运行，不污染任何已有数据库文件。
+测试覆盖：内存数据库、自动建表、全部 CRUD、条件查询、排序与分页（含按主键排序、游标分页、NULL 排序）、关键字搜索（大小写、字段限制、通配符、注入防护）、参数绑定与特殊字符、多模型共享连接、文件持久化、字段同步与删除、自动时间戳（含旧表迁移）、关闭后拒绝操作、事务（提交 / 回滚 / 嵌套拒绝）、条件操作符（范围 / 集合 / 区间 / 判空 / 超长 IN 拆分）、批量写入（分批、原子性、字段集合校验）、upsert、字段投影、按列计数、约束错误细分、并发首次打开只读恢复、非法参数拒绝、编译期类型检查等 164 个用例，全部可重复运行，不污染任何已有数据库文件。
 
 ## 暂未实现（第一版范围外）
 
 - 表关联与 JOIN 查询
-- 复杂的 WHERE 条件构造器（范围、OR、LIKE 等）
+- 复杂的 WHERE 条件构造器（OR / NOT 嵌套逻辑树、LIKE 条件——目前只有单字段操作符组合，之间为 AND）
+- 索引声明（`CREATE INDEX`）与查询计划提示
 - 完整的数据库迁移（字段重命名、类型修改、索引与约束管理等；目前仅支持新增字段的自动补齐和多余字段的手动删除）
 - 关系映射与懒加载
 - 事件系统、插件系统、缓存机制

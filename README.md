@@ -1322,8 +1322,8 @@ const ok = User.update(id, { age: 26 }) !== undefined;
 - `deleteMany()` 必须有非空条件，清空整表改用 `clear()`（避免漏传参数误删）；
 - 事务 `db.transaction()`、批量写入 `createMany` / `updateMany` / `upsertMany`；
 - 游标分页 `findPage()`、字段投影 `select`、按列计数 `count(_, { column })`；
-- 实例句柄 `User.db`（做 JOIN）与 `User.fields`（反射字段），方法可直接解构；
-- `db.model()` 幂等：同名同定义重复调用返回同一实例，不再抛 `InvalidModelError`；
+- 实例句柄 `User.db`（做 JOIN）与 `User.fields`（反射字段），方法可直接解构（2.1.0 新增）；
+- `db.model()` 幂等：同名同定义重复调用返回同一实例，不再抛 `InvalidModelError`（2.1.0 新增）；
 - 约束错误细分：`UniqueConstraintError` / `NotNullConstraintError` / `ForeignKeyConstraintError`。
 
 ## 开发

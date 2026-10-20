@@ -1,6 +1,6 @@
 import type { SQLOutputValue, SQLInputValue } from 'node:sqlite';
 import type { Database } from './database.js';
-import { InvalidModelError, SqlModelError, TransactionError, ValidationError } from './errors.js';
+import { SqlModelError, TransactionError, ValidationError } from './errors.js';
 import { translateSqliteError, isReadOnlyDatabaseError } from './sql-error.js';
 import type {
   CountOptions,
@@ -27,7 +27,6 @@ import type {
 } from './types.js';
 import {
   CREATED_AT,
-  FIELD_TYPES,
   MANAGED_COLUMNS,
   PRIMARY_KEY,
   UPDATED_AT,
@@ -42,6 +41,7 @@ import {
   managedColumnType,
   reservedFieldName,
   toSafeInteger,
+  validateModelDefinition,
   type DataEntry,
 } from './validate.js';
 
@@ -66,6 +66,34 @@ const DEFAULT_MUTATION_CHUNK = 500;
 /** `findPage` 未指定 limit 时的每页条数。 */
 const DEFAULT_PAGE_SIZE = 20;
 
+/**
+ * 需要在实例上绑定的公开方法。
+ *
+ * 私有方法只从 `this.xxx()` 调用，不会脱离实例，因此不必绑定；
+ * 显式列出而非遍历原型，既能避免把私有方法也变成自有属性，也让 `tsc` 能发现拼写错误。
+ */
+const BOUND_METHODS = [
+  'create',
+  'findById',
+  'findMany',
+  'findOne',
+  'exists',
+  'findByIds',
+  'findPage',
+  'search',
+  'update',
+  'delete',
+  'createMany',
+  'upsert',
+  'upsertMany',
+  'updateMany',
+  'deleteMany',
+  'clear',
+  'count',
+  'syncFields',
+  'deleteField',
+] as const;
+
 /** 单个字段的一个已解析条件。 */
 interface TupleCondition {
   field: string;
@@ -82,6 +110,8 @@ interface TupleCondition {
 export class Model<F extends ModelFields = ModelFields> {
   private readonly database: Database;
   private readonly fieldTypes: ReadonlyMap<string, FieldType>;
+  /** 声明时的字段表，冻结后对外暴露（`fields` getter）。 */
+  private readonly declaredFields: Readonly<F>;
 
   /** 模型名（注册时使用的名称） */
   readonly name: string;
@@ -90,55 +120,77 @@ export class Model<F extends ModelFields = ModelFields> {
 
   constructor(database: Database, name: string, definition: ModelDefinition<F>) {
     assertIdentifier(name, 'model name');
-    if (definition === null || typeof definition !== 'object' || Array.isArray(definition)) {
-      throw new InvalidModelError(
-        `Model definition must be an object with "tableName" and "fields", received ${describeValue(definition)}`,
-      );
-    }
-    const { tableName, fields } = definition;
-    if (tableName === undefined || fields === undefined) {
-      throw new InvalidModelError('Model definition requires both "tableName" and "fields"');
-    }
-    assertIdentifier(tableName, 'table name');
-    if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
-      throw new InvalidModelError(
-        `Model fields must be an object mapping field names to field types, received ${describeValue(fields)}`,
-      );
-    }
+    const { tableName, fields } = validateModelDefinition(definition);
     const fieldEntries = Object.entries(fields);
-    if (fieldEntries.length === 0) {
-      throw new InvalidModelError('Model must declare at least one field');
-    }
-    for (const [fieldName, fieldType] of fieldEntries) {
-      assertIdentifier(fieldName, 'field name');
-      const reserved = reservedFieldName(fieldName);
-      if (reserved !== null) {
-        throw new InvalidModelError(
-          `A declared field is reserved: "${reserved}" is managed automatically and cannot be declared on a model`,
-        );
-      }
-      if (typeof fieldType !== 'string' || !FIELD_TYPES.has(fieldType)) {
-        throw new InvalidModelError(
-          `Invalid field type: expected one of ${[...FIELD_TYPES].join(', ')}, received ${describeValue(fieldType)}`,
-        );
-      }
-    }
 
     this.database = database;
     this.name = name;
     this.tableName = tableName;
     this.fieldTypes = new Map(fieldEntries);
+    // 浅拷贝后冻结：直接返回调用方传入的对象时，外部改写会让 `fields` 与内部
+    // `fieldTypes` 出现两份互相矛盾的声明。
+    this.declaredFields = Object.freeze({ ...fields });
 
-    const columns = [
-      ...MANAGED_COLUMNS.map(([fieldName, fieldType]) => `"${fieldName}" ${fieldType}`),
-      ...fieldEntries.map(([fieldName, fieldType]) => `"${fieldName}" ${fieldType}`),
-    ];
-    // STRICT 让 SQLite 在存储层也强制列类型，配合 JS 侧校验形成双重防护
-    database.exec(
-      `CREATE TABLE IF NOT EXISTS "${tableName}" ("${PRIMARY_KEY}" INTEGER PRIMARY KEY AUTOINCREMENT, ${columns.join(', ')}) STRICT`,
-    );
-    // 表已存在但缺少模型声明的字段时（例如旧版本数据库文件），自动补齐
-    this.syncFields();
+    // 唯一性占位必须在建表之前：注册失败时不能改动已有表结构。
+    // 放在构造函数里，`new Model(...)` 这条绕过 db.model() 的路径也会被拦下。
+    const release = database.claimModelSlot(name, tableName);
+    try {
+      const columns = [
+        ...MANAGED_COLUMNS.map(([fieldName, fieldType]) => `"${fieldName}" ${fieldType}`),
+        ...fieldEntries.map(([fieldName, fieldType]) => `"${fieldName}" ${fieldType}`),
+      ];
+      // STRICT 让 SQLite 在存储层也强制列类型，配合 JS 侧校验形成双重防护
+      database.exec(
+        `CREATE TABLE IF NOT EXISTS "${tableName}" ("${PRIMARY_KEY}" INTEGER PRIMARY KEY AUTOINCREMENT, ${columns.join(', ')}) STRICT`,
+      );
+      // 表已存在但缺少模型声明的字段时（例如旧版本数据库文件），自动补齐
+      this.syncFields();
+    } catch (error) {
+      // 建表 / 补列失败时释放占位，避免注册表里留下没有对应模型的空壳
+      release();
+      throw error;
+    }
+
+    this.bindPublicMethods();
+  }
+
+  /**
+   * 绑定的数据库连接。
+   * 需要 JOIN、子查询或本库未覆盖的写法时，直接用 `User.db.prepare(...)`，
+   * 仍然共享同一个连接与事务。
+   */
+  get db(): Database {
+    return this.database;
+  }
+
+  /**
+   * 模型声明时的字段表（只读）。
+   * 用于通用后台、动态表单、导出表头这类需要反射字段的场景，
+   * 不必在模型之外再保存一份定义。
+   */
+  get fields(): Readonly<F> {
+    return this.declaredFields;
+  }
+
+  /**
+   * 把公开方法绑定到实例上。
+   *
+   * 方法都定义在原型上，依赖 `this`；一旦被解构（`const { create } = User`）
+   * 或作为回调传递（`items.map(User.create)`）就会丢 `this`，抛出与业务无关的 TypeError。
+   * 这里在构造时绑定一次，代价是每个模型实例多 19 个不可枚举的自有属性。
+   *
+   * 设为不可枚举，`Object.keys()` / `JSON.stringify()` 的既有外观保持不变。
+   */
+  private bindPublicMethods(): void {
+    const prototype = Model.prototype as unknown as Record<string, (this: Model<F>) => unknown>;
+    for (const method of BOUND_METHODS) {
+      Object.defineProperty(this, method, {
+        value: prototype[method]!.bind(this),
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
+    }
   }
 
   /**

@@ -90,6 +90,7 @@ db.close();
 - **关键字搜索**：`search()` 对 TEXT 字段做 OR LIKE 子串匹配（ASCII 大小写不敏感），支持指定字段与排序分页；`count()` 可带关键字统计搜索总数。
 - **字段同步与删除**：模型新增字段后重新打开数据库即自动补列（`syncFields`）；多余的列可手动删除（`deleteField`，仅允许删除模型未声明的字段，防止误删）。
 - **共享连接**：一个 `Database` 实例统一管理连接，多个模型共享，`close()` 后所有操作明确报错。
+- **幂等注册**：同名且定义一致的 `db.model()` 返回同一实例，各模块可各自声明模型而不必集中管理；定义不一致则直接报错。
 - **双格式产物**：同时发布 ESM（`.mjs`）和 CJS（`.cjs`），附带完整的 `.d.ts` / `.d.mts` 类型声明。
 
 ## 环境要求（重要）
@@ -229,7 +230,7 @@ db.close();
 
 注册并创建一个模型，返回 `Model` 实例。
 
-- `name: string` — 模型名，同一 `Database` 实例内必须唯一，重复注册抛 `InvalidModelError`。
+- `name: string` — 模型名，同一 `Database` 实例内必须唯一（见下方幂等规则）。
 - `definition` — 模型定义：
   - `tableName: string` — 表名，必须是合法 SQL 标识符（`/^[A-Za-z_][A-Za-z0-9_]*$/`），且不能与其他模型重复；
   - `fields: Record<string, FieldType>` — 字段声明，字段名同样是合法标识符，且不能是保留的 `id`、`createdAt`、`updatedAt`
@@ -250,14 +251,28 @@ db.close();
 - `STRICT` 模式让 SQLite 在存储层也强制列类型，与 JS 侧校验形成双重防护。
 - 如果表已存在但缺少模型声明的字段，注册时会自动补齐（见 [`syncFields()`](#syncfields-string)）。
 
+**幂等注册**：同名且 `tableName` / `fields` 完全一致的重复调用**返回同一个实例**，
+所以各模块可以各自写 `db.model('User', { … })`，不必把模型集中到一处再导出：
+
+```typescript
+// a.ts
+export const User = db.model('User', { tableName: 'users', fields: { name: 'TEXT' } });
+// b.ts —— 定义相同，拿到的是 a.ts 里那个实例
+export const User = db.model('User', { tableName: 'users', fields: { name: 'TEXT' } });
+```
+
+字段比较与书写顺序无关，`{ a, b }` 与 `{ b, a }` 视为同一份定义。
+同名但定义不同（表名不同、或字段集合不同）会抛 `InvalidModelError` ——
+这通常意味着两个模块对同一张表的认知已经漂移，宁可启动失败也不要带着不一致的 schema 跑下去。
+
 关于模型实例的生命周期：
 
-- **同一个 `Database` 上同名模型只能注册一次**：重复 `db.model('User', …)` 抛 `InvalidModelError`。
-  需要在多处拿到同一个模型时，把返回值存到模块级变量复用，不要重复注册；
 - **不同 `Database` 实例注册同名模型是允许的**（它们连的是不同文件，互不影响）；
 - `db.close()` 之后模型对象仍存在，但所有方法都会抛 `DatabaseClosedError`；
 - 注册时会执行 DDL（`CREATE TABLE` / `ALTER TABLE`），因此**应在启动阶段完成**，
-  不要在高频请求路径里反复调用。
+  不要在高频请求路径里反复调用（命中幂等缓存时不执行 DDL，但仍有定义比较的开销）。
+- `new Model(db, name, definition)` 虽然可以构造，但同样受唯一性约束：
+  表名或模型名已被占用时抛 `InvalidModelError`，与 `db.model()` 一致。
 
 #### `db.close()`
 
@@ -355,6 +370,48 @@ const row = stmt.get(18) as { n: number };
 ### `class Model<F>`
 
 `db.model()` 的返回值，泛型 `F` 为字段定义，自动推导字段名和值类型。
+
+#### 实例属性
+
+| 属性 | 类型 | 说明 |
+| --- | --- | --- |
+| `name` | `string` | 注册时使用的模型名 |
+| `tableName` | `string` | 绑定的数据表名 |
+| `db` | `Database` | 模型背后的连接，用于 JOIN / 子查询等本库未覆盖的写法 |
+| `fields` | `Readonly<F>` | 声明时的字段表（冻结的副本） |
+
+`db` 和 `fields` 是给「模型层表达不了」的场景准备的逃生口：
+
+```typescript
+// JOIN：直接复用同一个连接，事务也在一起
+const rows = User.db.prepare(`
+  SELECT u."name", COUNT(o."id") AS orders
+  FROM "users" u LEFT JOIN "orders" o ON o."userId" = u."id"
+  GROUP BY u."id"
+`).all();
+
+// 通用后台 / 动态表单：反射字段声明，不必另存一份
+for (const [field, type] of Object.entries(User.fields)) {
+  console.log(field, type);
+}
+```
+
+`fields` 返回的是构造时浅拷贝并冻结的对象——改写它既不会影响模型行为，
+也不会影响你自己传进去的那份 `fields` 字面量。
+
+**方法可以直接解构**：所有公开方法在构造时绑定到实例上，因此下面两种写法都成立：
+
+```typescript
+const { create, count } = User;
+create({ name: '张三' });
+count();
+
+// 作为回调传递也不会丢 this
+const rows = [{ name: '张三' }, { name: '李四' }].map(User.create);
+```
+
+绑定产生的是**不可枚举**的自有属性，`Object.keys(User)` / `JSON.stringify(User)` 的外观与绑定前一致。
+代价是每个模型实例多 19 个闭包，单个 `Database` 上模型数量有限，可以忽略。
 
 #### `create(data): ModelRow<F>`
 
@@ -1055,6 +1112,8 @@ try {
 | --- | --- | --- |
 | `Field "id" is managed automatically ...` | 在写路径传了托管列（`id` / `createdAt` / `updatedAt`） | 从 data 中移除；由数据库写入 |
 | `The model has no such field in ...` | 字段名拼错或大小写不符（模型字段大小写敏感） | 对照 `fields` 声明 |
+| `already registered with a different definition` | 同名 `db.model()` 两次，但表名或字段集合不一致 | 统一两处的模型定义，或复用同一实例 |
+| `This tableName is already used by another model` | 两个模型指向同一张表 | 一个表只注册一个模型 |
 | `Invalid field name: identifiers must match ...` | 表名 / 字段名含非法字符（空格、中文、`-`） | 改用字母数字下划线 |
 | `... options.limit must be a positive integer` | `limit: 0` 或负数 | 至少为 1 |
 | `... options.offset requires options.limit` | 只传了 `offset` | 同时传 `limit` |
@@ -1263,6 +1322,8 @@ const ok = User.update(id, { age: 26 }) !== undefined;
 - `deleteMany()` 必须有非空条件，清空整表改用 `clear()`（避免漏传参数误删）；
 - 事务 `db.transaction()`、批量写入 `createMany` / `updateMany` / `upsertMany`；
 - 游标分页 `findPage()`、字段投影 `select`、按列计数 `count(_, { column })`；
+- 实例句柄 `User.db`（做 JOIN）与 `User.fields`（反射字段），方法可直接解构；
+- `db.model()` 幂等：同名同定义重复调用返回同一实例，不再抛 `InvalidModelError`；
 - 约束错误细分：`UniqueConstraintError` / `NotNullConstraintError` / `ForeignKeyConstraintError`。
 
 ## 开发

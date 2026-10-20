@@ -10,6 +10,7 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "declaration": true,
+    "stripInternal": true,
     "noEmit": true,
     "types": ["node"]
   },

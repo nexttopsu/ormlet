@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { Database, DatabaseClosedError, InvalidModelError, LockTimeoutError, SqlModelError, ValidationError } from '../src/index.js';
+import { Database, DatabaseClosedError, InvalidModelError, LockTimeoutError, Model, SqlModelError, ValidationError } from '../src/index.js';
 
 // 传入故意非法的参数时绕过编译期检查，测试运行时校验
 const invalid = (value: unknown): never => value as never;
@@ -80,13 +80,61 @@ describe('Database', () => {
     db.close();
   });
 
-  test('rejects a duplicate model name', () => {
+  test('returns the same instance for a repeated identical definition', () => {
+    const db = new Database(':memory:');
+    const first = db.model('User', { tableName: 'users', fields: { name: 'TEXT', age: 'INTEGER' } });
+    // 字段声明顺序不同也算同一份定义：各模块不必约定书写顺序
+    const second = db.model('User', { tableName: 'users', fields: { age: 'INTEGER', name: 'TEXT' } });
+    assert.equal(second, first);
+    first.create({ name: '张三' });
+    assert.equal(second.count(), 1);
+    db.close();
+  });
+
+  test('rejects a repeated model name with a different definition', () => {
     const db = new Database(':memory:');
     db.model('User', { tableName: 'users', fields: { name: 'TEXT' } });
     assert.throws(
-      () => db.model('User', { tableName: 'users', fields: { name: 'TEXT' } }),
+      () => db.model('User', { tableName: 'users', fields: { name: 'TEXT', age: 'INTEGER' } }),
       InvalidModelError,
     );
+    // 表名不同同样算定义不同
+    assert.throws(
+      () => db.model('User', { tableName: 'users_2', fields: { name: 'TEXT' } }),
+      InvalidModelError,
+    );
+    db.close();
+  });
+
+  test('applies the same uniqueness rules to direct construction', () => {
+    const db = new Database(':memory:');
+    db.model('User', { tableName: 'users', fields: { name: 'TEXT' } });
+
+    // new Model(...) 绕过 db.model()，但不能绕过注册表：表和模型名都已被占用
+    assert.throws(
+      () => new Model(db, 'Account', { tableName: 'users', fields: { title: 'TEXT' } }),
+      InvalidModelError,
+    );
+    assert.throws(
+      () => new Model(db, 'User', { tableName: 'accounts', fields: { title: 'TEXT' } }),
+      InvalidModelError,
+    );
+
+    // 未占用的名字 + 表名仍然可以构造（构造函数本身是公开的合法入口）
+    const Log = new Model(db, 'Log', { tableName: 'logs', fields: { message: 'TEXT' } });
+    assert.equal(Log.create({ message: 'hi' }).message, 'hi');
+    db.close();
+  });
+
+  test('releases a claimed slot when construction fails', () => {
+    const db = new Database(':memory:');
+    // 直接预占再释放，等价于「构造中途失败」的情形
+    const release = db.claimModelSlot('Temp', 'temp');
+    assert.throws(() => db.model('Temp', { tableName: 'temp2', fields: { n: 'TEXT' } }), InvalidModelError);
+    release();
+    // 占位释放后，同名同表可以重新注册
+    const Temp = db.model('Temp', { tableName: 'temp', fields: { n: 'TEXT' } });
+    assert.equal(Temp.tableName, 'temp');
     db.close();
   });
 

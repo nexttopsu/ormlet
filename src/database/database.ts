@@ -4,7 +4,7 @@ import { DatabaseClosedError, InvalidModelError, TransactionError, ValidationErr
 import { Model } from './model.js';
 import { isLockConflict, isReadOnlyDatabaseError, translateSqliteError } from './sql-error.js';
 import type { DatabaseOptions, ModelDefinition, ModelFields } from './types.js';
-import { describeValue } from './validate.js';
+import { describeValue, validateModelDefinition } from './validate.js';
 
 /** 发出进程级警告（与 node:sqlite 的 ExperimentalWarning 同渠道，可用 --no-warnings 静默）。 */
 function emitWarning(message: string, code: string): void {
@@ -31,13 +31,37 @@ const READONLY_REOPEN_BACKOFF_MS = 5;
 const JOURNAL_MODES = new Set(['WAL', 'DELETE', 'MEMORY']);
 
 /**
+ * 判断两次 `db.model()` 调用描述的是不是同一个模型。
+ *
+ * 字段比较与声明顺序无关：`{ a, b }` 与 `{ b, a }` 视为同一份定义。
+ * 定义本身非法时由 `validateModelDefinition` 直接抛出校验错误，
+ * 这样「同名 + 非法定义」不会被误报成「定义不同」。
+ */
+function matchesDefinition(
+  model: Model<ModelFields>,
+  definition: ModelDefinition<ModelFields>,
+): boolean {
+  const { tableName, fields } = validateModelDefinition(definition);
+  if (model.tableName !== tableName) return false;
+  const declared = model.fields;
+  const declaredKeys = Object.keys(declared);
+  if (declaredKeys.length !== Object.keys(fields).length) return false;
+  for (const key of declaredKeys) {
+    if (!Object.prototype.hasOwnProperty.call(fields, key)) return false;
+    if (declared[key] !== fields[key]) return false;
+  }
+  return true;
+}
+
+/**
  * 数据库：统一持有唯一的 `node:sqlite` 连接，
  * 负责模型的注册、建表和资源关闭。所有模型共享该连接。
  */
 export class Database {
   private connection: DatabaseSync;
   private readonly path: string;
-  // 仅用于模型名查重；模型实例由 model() 直接返回给调用方持有
+  // 已注册的模型：用于幂等注册（同名 + 同定义时返回同一个实例）
+  private readonly models = new Map<string, Model<ModelFields>>();
   private readonly modelNames = new Set<string>();
   private readonly tableOwners = new Map<string, string>();
   private closed = false;
@@ -161,29 +185,56 @@ export class Database {
    * 注册并创建一个数据模型。
    * 模型定义会在创建时校验；不存在的表会自动创建（自增 `id` 主键 + STRICT 模式），
    * 表中缺失的模型字段也会自动补齐。
-   * 重复的模型名或表名会抛出 InvalidModelError。
+   *
+   * **幂等**：同名且 `tableName` 与 `fields` 完全一致的重复调用返回同一个实例，
+   * 因此各模块可以各自 `db.model('User', { ... })` 而不必集中到一处注册；
+   * 同名但定义不同、或表名已被其他模型占用时抛 InvalidModelError。
    */
   model<F extends ModelFields>(name: string, definition: ModelDefinition<F>): Model<F> {
     this.assertOpen();
+
+    const existing = this.models.get(name);
+    if (existing !== undefined) {
+      // 定义非法时 matchesDefinition 会直接抛出校验错误，不会误判成「定义不同」
+      // 注册表是异构的（每个模型有自己的 F），命中时按调用方声明的 F 返回：
+      // 能命中就说明两份定义结构一致，此处的转换是安全的。
+      if (matchesDefinition(existing, definition)) return existing as unknown as Model<F>;
+      throw new InvalidModelError(
+        'A model with this name is already registered with a different definition; ' +
+          'a repeated db.model() call must pass the same tableName and fields',
+      );
+    }
+
+    const model = new Model<F>(this, name, definition);
+    this.models.set(name, model as unknown as Model<ModelFields>);
+    return model;
+  }
+
+  /**
+   * @internal 预占模型名与表名，仅供 `Model` 构造函数调用。
+   *
+   * 唯一性校验放在这里而不是 `model()`，是为了让直接 `new Model(...)`
+   * 这条绕过注册表的路径同样受约束。返回的函数在构造失败（建表 / 补列抛错）
+   * 时释放占位，避免留下没有对应模型的空壳记录。
+   */
+  claimModelSlot(name: string, tableName: string): () => void {
     if (this.modelNames.has(name)) {
       throw new InvalidModelError(
         'A model with this name is already registered on this database; model names must be unique',
       );
     }
-    // 表名占用检查必须在构造模型之前：模型构造会建表并补齐字段（ALTER TABLE），
-    // 注册失败时不能改动已有表结构
-    if (definition !== null && typeof definition === 'object') {
-      const owner = this.tableOwners.get(definition.tableName);
-      if (owner !== undefined) {
-        throw new InvalidModelError(
-          'This tableName is already used by another model; each model needs its own tableName',
-        );
-      }
+    const owner = this.tableOwners.get(tableName);
+    if (owner !== undefined) {
+      throw new InvalidModelError(
+        'This tableName is already used by another model; each model needs its own tableName',
+      );
     }
-    const model = new Model<F>(this, name, definition);
-    this.tableOwners.set(model.tableName, name);
     this.modelNames.add(name);
-    return model;
+    this.tableOwners.set(tableName, name);
+    return () => {
+      this.modelNames.delete(name);
+      this.tableOwners.delete(tableName);
+    };
   }
 
   /**
@@ -197,6 +248,7 @@ export class Database {
     if (this.closed) return;
     this.rollbackOnClose();
     this.closed = true;
+    this.models.clear();
     this.modelNames.clear();
     this.tableOwners.clear();
     this.connection.close();

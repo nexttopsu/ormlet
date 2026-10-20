@@ -630,3 +630,67 @@ describe('search 关键字搜索', () => {
     db2.close();
   });
 });
+
+describe('instance handles', () => {
+  test('methods keep working when destructured', () => {
+    // 方法定义在原型上并依赖 this；构造函数里绑定后，解构调用不会丢 this
+    const { create, findById, count } = User;
+    const row = create({ name: '张三', age: 25 });
+    assert.equal(row.name, '张三');
+    assert.equal(findById(row.id)?.age, 25);
+    assert.equal(count(), 1);
+  });
+
+  test('methods keep working as callbacks', () => {
+    // 单签名的 exists 可以直接作为回调传递（多签名的 findById 交给 TS 重载解析不合适）
+    const { exists } = User;
+    User.create({ name: 'a' });
+    User.create({ name: 'b' });
+    assert.deepEqual([{ name: 'a' }, { name: 'b' }, { name: 'c' }].map(exists), [true, true, false]);
+  });
+
+  test('bound methods do not change the enumerable surface', () => {
+    // 绑定产生的是不可枚举的自有属性：Object.keys / JSON.stringify 看不到方法，
+    // 与绑定前保持一致（否则 console.log 与序列化结果会莫名其妙变长）
+    const own = User as unknown as Record<string, unknown>;
+    const methodKeys = Object.keys(User).filter((key) => typeof own[key] === 'function');
+    assert.deepEqual(methodKeys, []);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(User, 'create'), false);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(User, 'findMany'), false);
+  });
+
+  test('exposes the underlying connection', () => {
+    User.create({ name: '张三', age: 25 });
+    // 需要 JOIN 或本库未覆盖的写法时，可直接复用同一条连接
+    const rows = User.db.prepare('SELECT "name" FROM "users" WHERE "age" = ?').all(25) as Array<{
+      name: string;
+    }>;
+    assert.deepEqual(rows.map((row) => row.name), ['张三']);
+    assert.equal(User.db, db);
+  });
+
+  test('exposes a frozen copy of the declared fields', () => {
+    const fields = {
+      name: 'TEXT',
+      age: 'INTEGER',
+      email: 'TEXT',
+      score: 'REAL',
+      avatar: 'BLOB',
+    } as const;
+    const Fresh = db.model('Fresh', { tableName: 'fresh', fields });
+    assert.deepEqual({ ...Fresh.fields }, fields);
+    // 冻结的是拷贝：改不动模型声明，也改不动调用方自己传进去的对象
+    assert.equal(Object.isFrozen(Fresh.fields), true);
+    assert.throws(() => {
+      (Fresh.fields as Record<string, string>).name = 'INTEGER';
+    }, TypeError);
+    assert.equal(fields.name, 'TEXT');
+  });
+
+  test('rejects managed columns in the declared fields map', () => {
+    assert.throws(
+      () => db.model('Bad', { tableName: 'bad', fields: { name: 'TEXT', id: 'INTEGER' } }),
+      Error,
+    );
+  });
+});

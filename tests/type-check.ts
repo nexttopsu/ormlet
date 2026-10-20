@@ -30,6 +30,22 @@ const User = db.model('User', {
 
 const modelTyped: Model<UserFields> = User;
 
+// ---- 实例句柄：幂等注册 / db / fields ----
+
+// 幂等注册：同一份定义重复调用，类型仍是调用点自己声明的这份
+const sameModel: Model<UserFields> = db.model('User', {
+  tableName: 'users',
+  fields: { age: 'INTEGER', name: 'TEXT', email: 'TEXT', score: 'REAL', avatar: 'BLOB' },
+});
+
+const connection: Database = modelTyped.db;
+const declaredFields: Readonly<UserFields> = modelTyped.fields;
+
+// @ts-expect-error fields 只读，不允许改写声明
+modelTyped.fields.name = 'INTEGER';
+
+void [sameModel, connection, declaredFields];
+
 const created: ModelRow<UserFields> = modelTyped.create({
   name: '张三',
   age: 25,

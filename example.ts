@@ -69,6 +69,17 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
   console.log('deleteMany({ age: { lt: 0 } }):', User.deleteMany({ age: { lt: 0 } }));
   console.log('clear():', User.clear());
 
+  // 实例句柄：幂等注册 / 方法可解构 / 拿得到连接与字段声明
+  console.log('重复注册是否同一实例:', db.model('User', {
+    tableName: 'users',
+    fields: { name: 'TEXT', age: 'INTEGER', email: 'TEXT' },
+  }) === User);
+  const { create: createUser, count: countUsers } = User;
+  createUser({ name: '王五', age: 28 });
+  console.log('解构后 count():', countUsers());
+  console.log('User.fields:', User.fields, 'frozen =', Object.isFrozen(User.fields));
+  console.log('User.db 直接查询:', User.db.prepare('SELECT COUNT(*) AS n FROM "users"').get());
+
   // 关闭数据库
   db.close();
   console.log('database closed, isOpen =', db.isOpen);

@@ -1,5 +1,5 @@
 import type { SQLInputValue } from 'node:sqlite';
-import type { FieldType } from './types.js';
+import type { FieldType, ModelDefinition, ModelFields } from './types.js';
 import { InvalidModelError, SqlModelError, ValidationError } from './errors.js';
 
 /** 每张表自动创建的自增主键列名。 */
@@ -55,6 +55,51 @@ export function assertIdentifier(
       `Invalid ${kind}: identifiers must match /^[A-Za-z_][A-Za-z0-9_]*$/, received ${describeIdentifier(name)}`,
     );
   }
+}
+
+/**
+ * 校验并规范化模型定义，返回表名与字段表。
+ *
+ * `db.model()` 与 `Model` 构造函数共用这一份规则：前者要在命中缓存前判断
+ * 「同名调用传的是不是同一份定义」，后者要在建表前确认标识符与类型合法。
+ */
+export function validateModelDefinition<F extends ModelFields>(
+  definition: ModelDefinition<F>,
+): { tableName: string; fields: Readonly<F> } {
+  if (definition === null || typeof definition !== 'object' || Array.isArray(definition)) {
+    throw new InvalidModelError(
+      `Model definition must be an object with "tableName" and "fields", received ${describeValue(definition)}`,
+    );
+  }
+  const { tableName, fields } = definition;
+  if (tableName === undefined || fields === undefined) {
+    throw new InvalidModelError('Model definition requires both "tableName" and "fields"');
+  }
+  assertIdentifier(tableName, 'table name');
+  if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
+    throw new InvalidModelError(
+      `Model fields must be an object mapping field names to field types, received ${describeValue(fields)}`,
+    );
+  }
+  const fieldEntries = Object.entries(fields);
+  if (fieldEntries.length === 0) {
+    throw new InvalidModelError('Model must declare at least one field');
+  }
+  for (const [fieldName, fieldType] of fieldEntries) {
+    assertIdentifier(fieldName, 'field name');
+    const reserved = reservedFieldName(fieldName);
+    if (reserved !== null) {
+      throw new InvalidModelError(
+        `A declared field is reserved: "${reserved}" is managed automatically and cannot be declared on a model`,
+      );
+    }
+    if (typeof fieldType !== 'string' || !FIELD_TYPES.has(fieldType)) {
+      throw new InvalidModelError(
+        `Invalid field type: expected one of ${[...FIELD_TYPES].join(', ')}, received ${describeValue(fieldType)}`,
+      );
+    }
+  }
+  return { tableName, fields };
 }
 
 /**

@@ -436,7 +436,13 @@ export class Database {
     }
   }
 
-  /** @internal 在共享连接上预编译语句（模型内部使用） */
+  /**
+   * 逃生舱：在共享连接上预编译一条 SQL，返回底层 `node:sqlite` 的 `StatementSync`。
+   *
+   * 用于本库暂未封装的场景（建索引、PRAGMA、`VACUUM`、FTS5、JOIN 等）。
+   * **不做任何校验**：SQL 原样执行，业务数据值必须自己用 `?` 绑定，不要拼接用户输入。
+   * 遇到只读错误时会自动重开连接并重试一次。
+   */
   prepare(sql: string): StatementSync {
     this.assertOpen();
     try {
@@ -453,7 +459,12 @@ export class Database {
     }
   }
 
-  /** @internal 在共享连接上执行 SQL（模型内部使用） */
+  /**
+   * 逃生舱：在共享连接上执行一段 SQL（可含多条语句），无返回值。
+   *
+   * 与 `prepare` 一样不做校验，语句里的表名 / 列名只能来自代码常量。
+   * 遇到只读错误时会自动重开连接并重试一次。
+   */
   exec(sql: string): void {
     this.assertOpen();
     try {
@@ -471,7 +482,11 @@ export class Database {
   }
 
   /**
-   * @internal 连接被 SQLite 判为只读时，关闭并重开连接以恢复写能力。
+   * 手动触发「只读连接恢复」：关闭当前连接、重新打开，并探测一次写能力，成功返回 `true`。
+   *
+   * 正常情况不需要调用——`prepare` / `exec` / 模型写入路径都会在识别到 `SQLITE_READONLY`
+   * 时自动恢复。只有**事务进行中**不会自动恢复（重开连接会丢事务），
+   * 此时可以直接调用它拿到明确的布尔结果，或等待事务结束后重试。
    *
    * 触发场景：多个进程同时初始化一个刚创建的空库，其中一个进程正在写文件头 / 切换 WAL，
    * 其他进程的连接会缓存到「库为空」的旧状态并持续拒绝写入（SQLITE_READONLY 不受 busy

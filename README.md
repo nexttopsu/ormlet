@@ -138,7 +138,7 @@ npm install ormlet
 npm install
 npm run build        # 构建产物到 dist/
 npm test             # TypeScript 编译检查 + 全部测试
-npm run dev          # 运行示例 example.ts
+npm run dev          # 运行示例 example.ts（覆盖全部 API，输出即速查表）
 ```
 
 ## 快速开始
@@ -1332,7 +1332,7 @@ const ok = User.update(id, { age: 26 }) !== undefined;
 npm run typecheck   # TypeScript 编译检查（含 tests/type-check.ts 编译期断言）
 npm test            # 编译检查 + 全部单元测试（node:test，无需新增依赖）
 npm run build       # tsup 构建 dist/（CJS + ESM + 类型声明）
-npm run dev         # 运行 example.ts 基础示例
+npm run dev         # 运行 example.ts：18 个小节依次覆盖全部 API，可当可执行的速查表
 npm run stress      # 压力测试：多进程初始化竞态 / 吞吐 / 20 万行规模 / 并发写 / 锁竞争 / 长稳 / 崩溃恢复 / 资源回收
 ```
 

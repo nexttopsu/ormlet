@@ -85,6 +85,9 @@ export function validateModelDefinition<F extends ModelFields>(
   if (fieldEntries.length === 0) {
     throw new InvalidModelError('Model must declare at least one field');
   }
+  // SQLite 的标识符大小写不敏感：`name` 与 `NAME` 会被当成同一列，
+  // 建表时只会得到一句 "duplicate column name"，这里提前给出可理解的错误
+  const seenFieldNames = new Set<string>();
   for (const [fieldName, fieldType] of fieldEntries) {
     assertIdentifier(fieldName, 'field name');
     const reserved = reservedFieldName(fieldName);
@@ -93,6 +96,13 @@ export function validateModelDefinition<F extends ModelFields>(
         `A declared field is reserved: "${reserved}" is managed automatically and cannot be declared on a model`,
       );
     }
+    if (seenFieldNames.has(fieldName.toLowerCase())) {
+      throw new InvalidModelError(
+        'Field names must be unique ignoring case: SQLite identifiers are case-insensitive, ' +
+          'so two fields cannot differ only by letter case',
+      );
+    }
+    seenFieldNames.add(fieldName.toLowerCase());
     if (typeof fieldType !== 'string' || !FIELD_TYPES.has(fieldType)) {
       throw new InvalidModelError(
         `Invalid field type: expected one of ${[...FIELD_TYPES].join(', ')}, received ${describeValue(fieldType)}`,

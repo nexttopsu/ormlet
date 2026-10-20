@@ -87,6 +87,8 @@ const pickedId: number = idOnly[0]!.id;
 modelTyped.findMany({ id: 'one' });
 // @ts-expect-error 时间戳只接受字符串
 modelTyped.findMany({ createdAt: 0 });
+// @ts-expect-error 条件不接受 null（SQL 的 column = NULL 永远不成立，判空请用 isNull）
+modelTyped.findMany({ name: null });
 // @ts-expect-error findOne 不接受 limit（语义上恒为 1）
 modelTyped.findOne({}, { limit: 2 });
 // @ts-expect-error deleteMany 必须有条件（清空请用 clear）

@@ -611,7 +611,9 @@ for (;;) {
 ```
 
 实现细节：每次多取一行（`LIMIT limit + 1`）来判断 `hasMore`，因此**不需要额外发一次 `COUNT`**；
-`nextCursor` 由最后一行的 `(排序字段值, id)` 组成，`orderBy` 为 `id` 时 `value` 为 `null`。
+`nextCursor` 由最后一行的 `(排序字段值, id)` 组成，`orderBy` 为 `id` 时 `value` 为 `null`；
+排序字段为 BLOB 时 `value` 是 `Uint8Array`（原样回传即可）。游标值与排序列的类型不一致
+（例如把别的查询的游标丢进来）会抛 `ValidationError`——SQLite 跨类型比较不会报错，只会静默返回错页。
 
 > **`select` 与游标的类型陷阱**：`findPage` 必须知道排序字段与主键才能生成 `nextCursor`，
 > 因此即使 `select` 里没写，也会把这两列补进 SQL。但**返回类型只反映 `select` 里列出的列**，
@@ -768,9 +770,9 @@ min(chunkSize, floor(30000 / (字段数 + 2)))
 例：15 个字段 + `chunkSize: 500` → `floor(30000 / 17) = 1764`，仍取 500；40 个字段 → 取 714 → 仍 500；
 80 个字段 → `floor(30000/82) = 365`，此时单条语句只插 365 行。
 
-返回的 id 按参数顺序排列。它是从最后一条语句的 `lastInsertRowid` 倒推出来的
-（同一 `VALUES (...)` 语句内的自增 id 连续），因此**不适用于 `WITHOUT ROWID` 表或外部触发器导致 id 跳号的场景**；
-本库不会创建这类表，但如果你用裸 `db.exec` 改过表结构或加过触发器，请以实际查询结果为准。
+返回的 id 按参数顺序排列，来自插入语句的 `RETURNING`，只包含**真正插入**的行：
+如果表上有 `RAISE(IGNORE)` 这类会静默跳过某些行的触发器，被跳过的行不会出现在返回值里
+（数组长度会小于入参长度），此时以返回值而非下标对应入参。
 
 **吞吐参考**（本机 SSD，`synchronous = FULL`，字段数 4）：
 
@@ -842,6 +844,8 @@ User.deleteMany({ age: { lt: 18 } });
 - **必须提供非空条件**：`deleteMany()` 与 `deleteMany({})` 都会抛 `ValidationError`。
   读取（`findMany()` 返回全表）与删除（清空全表）的代价并不对称，
   一次误调用就是不可恢复的数据丢失，因此清空必须显式声明意图；
+- 「非空」看的是**解析后的条件**：`{ age: undefined }` 虽然有键，但该字段不参与筛选，
+  等价于无条件，同样会被拒绝；
 - 确实要清空时用 `clear()`，或显式传 `{ confirm: 'all' }` 走同一个入口；
 - `options.confirm` 只接受字面量 `'all'`，传其他值（如 `'yes'`）也会抛 `ValidationError`。
 

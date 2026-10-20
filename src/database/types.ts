@@ -96,10 +96,12 @@ export type WhereOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'in' | '
  * 操作符对象按「先列举、后排除」推导，因此字段类型与操作符不匹配时编译期就能发现：
  * `isNull` 只接受布尔值，`in` 只接受数组，`between` 只接受二元组，
  * 其余操作符只接受与字段类型一致的单值。
+ *
+ * 这里**不包含 `null`**：SQL 的 `column = NULL` 永远不成立，运行期会直接抛错，
+ * 判空请写 `{ isNull: true }`；写 `null` 在编译期就该被拦下。
  */
 export type FieldCondition<T> =
   | T
-  | null
   | {
       eq?: NonNullable<T>;
       ne?: NonNullable<T>;
@@ -209,8 +211,11 @@ export type TextFieldNames<F extends ModelFields> = {
  * 作为返回值给出时视为不透明，回传给 `after` 即可，不需要自己构造。
  */
 export interface Cursor {
-  /** 排序字段的取值（排序字段是 `id` 时为 null，此时只用主键比较） */
-  value: string | number | null;
+  /**
+   * 排序字段的取值（排序字段是 `id` 时为 null，此时只用主键比较）。
+   * 排序字段为 BLOB 时是 `Uint8Array`：原样回传即可，不要转成字符串。
+   */
+  value: string | number | Uint8Array | null;
   /** 该行的主键，用于在同值时打破平局 */
   id: number;
 }
@@ -286,7 +291,8 @@ export interface CreateManyOptions {
    *
    * - `true`：所有行必须声明完全相同的字段（可以省略为 `undefined`，视为不写该列）。
    *   一旦出现不一致，各行的缺失字段含义就会在 NULL 与「不写入」之间摇摆，因此直接拒绝；
-   * - `false`：逐行按 SQL 默认值插入缺失字段。只在这确实是期望行为时使用。
+   * - `false`：缺失字段统一写入 NULL。注意整批共用一条 INSERT，列清单是所有行的并集，
+   *   因此缺失的列**不会**触发表定义里的 `DEFAULT`（显式写入 NULL 会覆盖默认值）。
    *
    * 逐行给出的显式 `null` 与省略的 `undefined` 视为等价（都写入 NULL）。
    */

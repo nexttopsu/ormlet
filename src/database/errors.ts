@@ -33,8 +33,8 @@ export class TransactionError extends SqlModelError {}
 
 /**
  * 数据库被其他连接锁定，且在 busy timeout 内始终未能取得锁时抛出。
- * 继承自 SqlModelError，可通过 `instanceof LockTimeoutError` 与普通 SQL 错误区分，
- * 也可以在捕获后重试（见 `isLockTimeoutError`）。
+ * 继承自 SqlModelError，可通过 `instanceof LockTimeoutError` 与普通 SQL 错误区分
+ * （`error.errcode` 进一步区分 SQLITE_BUSY / SQLITE_LOCKED），捕获后可以重试。
  */
 export class LockTimeoutError extends SqlModelError {
   /** 触发该错误的原始 errcode（SQLITE_BUSY / SQLITE_LOCKED 等），便于细粒度判断。 */

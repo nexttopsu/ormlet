@@ -242,6 +242,18 @@ describe('createMany', () => {
     assert.equal(User.count(), 0);
   });
 
+  test('only reports rows that were actually inserted', () => {
+    // 自建触发器用 RAISE(IGNORE) 静默跳过某些行时，同一语句内的 id 不再连续：
+    // 由 lastInsertRowid 反推会返回根本不存在的 id（之前会给出 [0, 1, 2]）
+    db.exec(
+      `CREATE TRIGGER "skip_rows" BEFORE INSERT ON "users" WHEN NEW."name" = 'skip' BEGIN SELECT RAISE(IGNORE); END`,
+    );
+    const ids = User.createMany([{ name: 'a' }, { name: 'skip' }, { name: 'b' }], { chunkSize: 10 });
+    assert.deepEqual(ids, [1, 2]);
+    assert.deepEqual(User.findMany(undefined, { orderBy: 'id', order: 'ASC' }).map((row) => row.name), ['a', 'b']);
+    assert.equal(User.count(), 2);
+  });
+
   test('rejects rows with different field sets by default', () => {
     assert.throws(() => User.createMany([{ name: 'a' }, { name: 'b', age: 1 }]), ValidationError);
   });
@@ -463,6 +475,14 @@ describe('upsert', () => {
     assert.throws(() => User.upsert({ name: 'a' }, invalid({ update: { unknownField: 1 } })), ValidationError);
   });
 
+  test('rejects empty data instead of emitting invalid SQL', () => {
+    // data 与 update 都为空时列清单为 0，拼出来是 `INSERT INTO t () VALUES (, ?, ?)`：
+    // 之前会以「SQLite error 1」这种无从下手的错误冒出来，现在与 create() 一致地前置拒绝
+    assert.throws(() => User.upsert(invalid({})), ValidationError);
+    assert.throws(() => User.upsert(invalid({}), invalid({ update: {} })), ValidationError);
+    assert.equal(User.count(), 0);
+  });
+
   test('upsertMany inserts and updates in one transaction', () => {
     const db2 = new Database(':memory:');
     const M = db2.model('M', { tableName: 'm', fields: { key: 'TEXT', value: 'INTEGER' } });
@@ -472,6 +492,13 @@ describe('upsert', () => {
     assert.equal(M.count(), 3);
     assert.equal(M.findMany({ key: 'a' })[0]!.value, 10);
     db2.close();
+  });
+
+  test('upsertMany rejects non-array input with ValidationError', () => {
+    // 先读 rows.length 会让 null / 普通对象以 TypeError 冒出来，而不是库自己的校验错误
+    assert.throws(() => User.upsertMany(invalid(null)), ValidationError);
+    assert.throws(() => User.upsertMany(invalid({ key: 'a' })), ValidationError);
+    assert.equal(User.upsertMany(invalid([])), 0);
   });
 });
 
@@ -707,6 +734,35 @@ describe('findPage cursor pagination', () => {
     assert.equal(overlap.length, 0);
   });
 
+  test('pages by a BLOB column without losing the cursor', () => {
+    const files = db.model('File', { tableName: 'files', fields: { name: 'TEXT', body: 'BLOB' } });
+    files.createMany([
+      { name: 'a', body: new Uint8Array([1]) },
+      { name: 'b', body: new Uint8Array([2]) },
+      { name: 'c', body: new Uint8Array([3]) },
+      { name: 'd', body: null },
+    ]);
+    // ASC 下 NULL 排最前，游标值是 null
+    const first = files.findPage({ orderBy: 'body', order: 'ASC', limit: 1 });
+    assert.equal(first.nextCursor?.value, null);
+    assert.equal(first.hasMore, true);
+
+    // 这一页的游标值是 Uint8Array：校验若只认 string / number，第二页会直接抛错
+    const second = files.findPage({ orderBy: 'body', order: 'ASC', limit: 2, after: first.nextCursor });
+    assert.ok(second.nextCursor?.value instanceof Uint8Array);
+    assert.deepEqual(
+      [...first.items, ...second.items].map((row) => row.name),
+      ['d', 'a', 'b'],
+    );
+
+    const third = files.findPage({ orderBy: 'body', order: 'ASC', limit: 2, after: second.nextCursor });
+    assert.deepEqual(
+      third.items.map((row) => row.name),
+      ['c'],
+    );
+    assert.equal(third.hasMore, false);
+  });
+
   test('rejects invalid page options', () => {
     insertMany(3);
     assert.throws(() => User.findPage(invalid({ offset: 10 })), ValidationError);
@@ -717,6 +773,15 @@ describe('findPage cursor pagination', () => {
     assert.throws(() => User.findPage(invalid({ after: 'abc' })), ValidationError);
     assert.throws(() => User.findPage(invalid({ after: { id: 1, value: {} } })), ValidationError);
     assert.throws(() => User.findPage(invalid({ unknown: 1 })), ValidationError);
+    // 游标值与排序列的存储类型不符：SQLite 跨类型比较不报错，只会静默返回空页/错页
+    assert.throws(
+      () => User.findPage(invalid({ orderBy: 'name', after: { id: 1, value: 5 } })),
+      ValidationError,
+    );
+    assert.throws(
+      () => User.findPage(invalid({ orderBy: 'age', after: { id: 1, value: '5' } })),
+      ValidationError,
+    );
   });
 });
 
@@ -786,6 +851,9 @@ describe('where on managed columns', () => {
     assert.throws(() => User.findMany(invalid({ id: '1' })), ValidationError);
     assert.throws(() => User.findMany(invalid({ id: { in: [null] } })), ValidationError);
     assert.throws(() => User.findMany(invalid({ id: { between: ['1', '2'] } })), ValidationError);
+    // 托管列允许大小写不敏感的写法，主键校验也必须跟着规范化，否则 { ID: 0 } 能绕过
+    assert.throws(() => User.findMany(invalid({ ID: 0 })), ValidationError);
+    assert.throws(() => User.findMany(invalid({ Id: { in: [1, 0] } })), ValidationError);
   });
 
   test('filters by timestamp range', () => {
@@ -862,7 +930,8 @@ describe('exists', () => {
 
   test('rejects invalid conditions like findMany', () => {
     assert.throws(() => User.exists(invalid({ nickname: 'x' })), ValidationError);
-    assert.throws(() => User.exists({ name: null }), ValidationError);
+    // 编译期已经拒绝 null 条件，这里绕过类型检查验证运行期的兜底
+    assert.throws(() => User.exists(invalid({ name: null })), ValidationError);
   });
 
   test('agrees with count > 0', () => {
@@ -927,6 +996,17 @@ describe('deleteMany guard rails', () => {
     assert.throws(() => User.deleteMany(invalid({})), ValidationError);
     // 拒绝之后数据必须完好
     assert.equal(User.count(), 2);
+  });
+
+  test('refuses to delete when every condition resolves to nothing', () => {
+    User.createMany([{ name: 'a' }, { name: 'b' }]);
+    // 键存在但值为 undefined 时，解析出的条件为空 —— 等价于「无条件」，
+    // 按 Object.keys 判断会放行全表删除
+    assert.throws(() => User.deleteMany(invalid({ name: undefined })), ValidationError);
+    assert.throws(() => User.deleteMany(invalid({ name: undefined, age: undefined })), ValidationError);
+    assert.equal(User.count(), 2);
+    // 显式 confirm 时仍然允许（与 clear() 等价）
+    assert.equal(User.deleteMany(invalid({ name: undefined }), { confirm: 'all' }).changes, 2);
   });
 
   test('clear() removes every row', () => {

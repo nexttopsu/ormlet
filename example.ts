@@ -234,7 +234,7 @@ log(
 
 // undefined 表示「该字段不参与筛选」，null 会被拒绝（SQL 里 column = NULL 永远不成立）。
 log('{ age: 28, score: undefined } 等价于 { age: 28 }', User.findMany({ age: 28, score: undefined }).length);
-expectError('条件传 null', ValidationError, () => User.findMany({ email: null }));
+expectError('条件传 null（类型层也已拦下）', ValidationError, () => User.findMany({ email: null } as never));
 expectError('未知操作符', ValidationError, () => User.findMany({ age: { like: 1 } } as never));
 expectError('非法 id', ValidationError, () => User.findById(0));
 

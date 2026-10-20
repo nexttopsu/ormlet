@@ -398,6 +398,7 @@ export class Model<F extends ModelFields = ModelFields> {
   > {
     // 实现签名只关心「有没有 select」，返回类型的收窄交给上面的泛型重载
     const { orderBy, order, limit, after } = this.validatePageOptions(options);
+    this.assertCursorMatches(orderBy, after);
     const columns = this.projection(options?.select, 'findPage()');
     const cursor = this.cursorCondition(orderBy, order, after);
     const params: SQLInputValue[] = [...cursor.params];
@@ -437,7 +438,10 @@ export class Model<F extends ModelFields = ModelFields> {
         hasMore && last !== undefined
           ? {
               id: last[PRIMARY_KEY] as number,
-              value: orderBy === PRIMARY_KEY ? null : ((last[orderBy] as string | number | null) ?? null),
+              value:
+                orderBy === PRIMARY_KEY
+                  ? null
+                  : ((last[orderBy] as string | number | Uint8Array | null) ?? null),
             }
           : null,
     };
@@ -544,7 +548,9 @@ export class Model<F extends ModelFields = ModelFields> {
    *   因此一条语句即可插完整批，缺省字段统一写入 NULL；
    * - 不在事务中调用时自动开启并提交；已在事务中时直接参与外层事务（失败不单独回滚）；
    * - 不会逐行回读整行（这也是比循环调用 `create()` 快的主要原因）；
-   * - 空数组返回空数组，不执行任何语句。
+   * - 空数组返回空数组，不执行任何语句；
+   * - 返回值来自 `RETURNING`，只包含**真正插入**的行：如果表上有 `RAISE(IGNORE)` 之类
+   *   会静默跳过行的触发器，被跳过的行不会出现在返回数组里（长度可能小于入参）。
    *
    * @example
    * const ids = User.createMany([
@@ -606,10 +612,13 @@ export class Model<F extends ModelFields = ModelFields> {
           `VALUES ${batch.map(() => rowSql).join(', ')}`;
         const params: SQLInputValue[] = [];
         for (const row of batch) params.push(...row, now, now);
-        const result = this.execute('createMany()', (db) => db.prepare(sql).run(...params));
-        // 多行 VALUES 的 lastInsertRowid 是最后一行，且同一语句内的 id 连续
-        const last = toSafeInteger(result.lastInsertRowid);
-        for (let i = batch.length - 1; i >= 0; i--) ids.push(last - i);
+        // 用 RETURNING 取回真正插入的行，而不是由 lastInsertRowid 反推：
+        // 用户自建的 BEFORE INSERT 触发器可以用 RAISE(IGNORE) 静默跳过某些行，
+        // 此时「同一语句内的 id 连续」并不成立，反推会返回根本不存在的 id（甚至 0）。
+        const inserted = this.execute('createMany()', (db) =>
+          db.prepare(`${sql} RETURNING "${PRIMARY_KEY}" AS id`).all(...params),
+        );
+        for (const row of inserted) ids.push(toSafeInteger(row.id as number | bigint));
       }
     });
     return ids;
@@ -667,6 +676,11 @@ export class Model<F extends ModelFields = ModelFields> {
         ...byField.keys(),
       ]),
     ];
+    // data 与 options.update 都为空时列清单为空，拼出来的 SQL 是 `INSERT INTO t () VALUES (, ?, ?)`，
+    // 语法错误会以「SQLite error 1」的形式冒出来，难以定位；与 create() 一致地在这里拒绝
+    if (fields.length === 0) {
+      throw new ValidationError('upsert() requires at least one field');
+    }
     const params: SQLInputValue[] = fields.map((field) => {
       if (byField.has(field)) return byField.get(field) as SQLInputValue;
       return (updateEntries.find(([name]) => name === field)?.[1] ?? null) as SQLInputValue;
@@ -721,13 +735,15 @@ export class Model<F extends ModelFields = ModelFields> {
    *
    * - 冲突判定与更新规则同 `upsert()`，整个批次在一个事务内完成；
    * - 每行逐条执行（不使用多行 VALUES），因此各行字段集合可以不同，缺失字段写入 NULL；
-   * - 不逐行回读，只返回影响行数（插入与更新都计 1）。
+   * - 不逐行回读，只返回影响行数（插入与更新各计 1；`DO NOTHING` 命中的行计 0，
+   *   需要知道「哪些行真的变了」时请改用逐条 `upsert()`）。
    */
   upsertMany(rows: ModelDataTuple<F>, options?: UpsertOptions<F>): number {
-    if (rows.length === 0) return 0;
+    // 数组检查必须在前：先读 rows.length 会让 null / 非数组以 TypeError 冒出来
     if (!Array.isArray(rows)) {
       throw new ValidationError(`upsertMany() expects an array of objects, received ${describeValue(rows)}`);
     }
+    if (rows.length === 0) return 0;
     const target = this.resolveUpsertTarget(options);
     const now = new Date().toISOString();
     const updateEntries =
@@ -852,21 +868,22 @@ export class Model<F extends ModelFields = ModelFields> {
     where: WhereInput<F> | undefined,
     options: DeleteManyOptions | undefined,
   ): MutationResult {
-    const confirmed = options?.confirm === 'all';
-    if (where === undefined || (typeof where === 'object' && where !== null && Object.keys(where).length === 0)) {
-      if (!confirmed) {
-        throw new ValidationError(
-          'deleteMany() requires a non-empty where condition; use clear() to delete every row in the table',
-        );
-      }
-    }
+    // 先校验 options 本身，非法参数（非对象、未知键、chunkSize 越界）才能报出自己的错误，
+    // 而不是被后面的条件护栏抢先报成「缺少 where」
+    const { chunkSize } = this.validateUpdateManyOptions(options, ['confirm']);
     if (options?.confirm !== undefined && options.confirm !== 'all') {
       throw new ValidationError(
         `deleteMany() options.confirm must be "all", received ${describeValue(options.confirm)}`,
       );
     }
     const conditions = this.validateWhere(where, 'deleteMany()');
-    const { chunkSize } = this.validateUpdateManyOptions(options, ['confirm']);
+    // 护栏必须看「解析后的条件」而不是传入对象的键数：`{ name: undefined }` 有键，
+    // 但解析结果为空（= 无条件），按 Object.keys 判断会放行全表删除。
+    if (conditions.length === 0 && options?.confirm !== 'all') {
+      throw new ValidationError(
+        'deleteMany() requires a non-empty where condition; use clear() to delete every row in the table',
+      );
+    }
     const whereSql = conditions.length > 0 ? conditions.map((c) => c.sql).join(' AND ') : '1 = 1';
     const whereParams = conditionParams(conditions);
     let changes = 0;
@@ -1107,7 +1124,8 @@ export class Model<F extends ModelFields = ModelFields> {
         }
         this.assertConditionValue(field, type, condition, `${context} conditions`);
         // 主键的等值条件额外要求正安全整数：{ id: 0 } 永远不可能命中，静默返回空数组会掩盖 bug
-        if (field === PRIMARY_KEY) assertConditionId(condition);
+        // 托管列可以大小写不敏感地书写（{ ID: 0 }），判定也要跟着规范化，否则大小写一变就绕过校验
+        if (reservedFieldName(field) === PRIMARY_KEY) assertConditionId(condition);
         conditions.push({ field, sql: `"${field}" = ?`, params: [condition as SQLInputValue] });
         continue;
       }
@@ -1168,6 +1186,8 @@ export class Model<F extends ModelFields = ModelFields> {
           throw new ValidationError(`${context} "in" lists cannot contain null; use isNull to match NULL values`);
         }
         this.assertConditionValue(field, type, item, `${context} "in" lists`);
+        // 与等值条件保持一致：非正整数的 id 永远不可能命中
+        if (reservedFieldName(field) === PRIMARY_KEY) assertConditionId(item);
       }
       // 超长列表分段：SQLite 的绑定参数总数有上限
       const chunks: SQLInputValue[][] = [];
@@ -1552,12 +1572,38 @@ export class Model<F extends ModelFields = ModelFields> {
     }
     const { id, value } = after as Cursor;
     assertId(id);
-    if (value !== null && typeof value !== 'string' && typeof value !== 'number') {
+    // BLOB 排序字段的游标值是 Uint8Array：原样回传时不能让校验把它挡在第二页外面
+    if (value !== null && typeof value !== 'string' && typeof value !== 'number' && !(value instanceof Uint8Array)) {
       throw new ValidationError(
         `findPage() options.after must be a cursor from a previous page, received ${describeValue(after)}`,
       );
     }
     return { id, value };
+  }
+
+  /**
+   * 校验游标值与排序列的存储类型一致。
+   *
+   * 游标是「上一页原样回传」的不透明值，类型不匹配只可能来自误用（例如把别的查询的游标、
+   * 或从 JSON 里读回来已经变形的值丢进来）。SQLite 跨类型比较不会报错，只会按类型序
+   * 静默返回空页或错页，因此这里提前拒绝。
+   */
+  private assertCursorMatches(orderBy: string, after: Cursor | null): void {
+    if (after === null || after.value === null || orderBy === PRIMARY_KEY) return;
+    const type = this.columnType(orderBy);
+    const value = after.value;
+    const matches =
+      type === 'BLOB'
+        ? value instanceof Uint8Array
+        : type === 'TEXT'
+          ? typeof value === 'string'
+          : typeof value === 'number';
+    if (!matches) {
+      throw new ValidationError(
+        'findPage() options.after does not match the type of the sort column; ' +
+          'pass page.nextCursor back unchanged instead of rebuilding it',
+      );
+    }
   }
 
   /**

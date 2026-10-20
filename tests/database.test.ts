@@ -5,7 +5,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { Database, DatabaseClosedError, InvalidModelError, LockTimeoutError, Model, SqlModelError, ValidationError } from '../src/index.js';
+import {
+  Database,
+  DatabaseClosedError,
+  InvalidModelError,
+  LockTimeoutError,
+  Model,
+  SqlModelError,
+  ValidationError,
+  isLockConflict,
+  translateSqliteError,
+} from '../src/index.js';
 
 // 传入故意非法的参数时绕过编译期检查，测试运行时校验
 const invalid = (value: unknown): never => value as never;
@@ -28,6 +38,18 @@ describe('Database', () => {
     assert.throws(() => new Database(''), ValidationError);
     assert.throws(() => new Database(invalid(null)), ValidationError);
     assert.throws(() => new Database(invalid(undefined)), ValidationError);
+  });
+
+  test('wraps path-level open failures as SqlModelError', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-open-'));
+    try {
+      // 父目录不存在 / 路径本身是目录：node:sqlite 抛的是裸 ERR_SQLITE_ERROR，
+      // 必须收敛成库自己的错误类型，否则调用方的 instanceof 判断会漏掉
+      assert.throws(() => new Database(path.join(dir, 'missing', 'data.db')), SqlModelError);
+      assert.throws(() => new Database(dir), SqlModelError);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('validates Database options', () => {
@@ -145,6 +167,12 @@ describe('Database', () => {
       () => db.model('Account', { tableName: 'users', fields: { title: 'TEXT' } }),
       InvalidModelError,
     );
+    // SQLite 的表名大小写不敏感：Users 与 users 是同一张物理表，
+    // 按原样比较会漏掉这个冲突，两个模型随后会往同一张表里各自 ALTER
+    assert.throws(
+      () => db.model('Account', { tableName: 'Users', fields: { title: 'TEXT' } }),
+      InvalidModelError,
+    );
     db.close();
   });
 
@@ -185,6 +213,9 @@ describe('Database', () => {
 
     assert.throws(() => db.model('M8', invalid({ tableName: 't8', fields: { a: 'VARCHAR(50)' } })), InvalidModelError);
     assert.throws(() => db.model('M9', invalid({ tableName: 't9', fields: { a: 'text' } })), InvalidModelError);
+
+    // SQLite 标识符大小写不敏感，只差大小写的两个字段名指向同一列
+    assert.throws(() => db.model('M10', { tableName: 't10', fields: { a: 'TEXT', A: 'TEXT' } }), InvalidModelError);
 
     db.close();
   });
@@ -574,6 +605,19 @@ describe('锁超时错误类型', () => {
       },
     );
     db.close();
+  });
+
+  test('识别锁冲突的扩展 errcode，而不只是主码', () => {
+    // 扩展码是 `主码 | (n << 8)`：261 BUSY_RECOVERY、262 LOCKED_SHAREDCACHE、
+    // 517 BUSY_SNAPSHOT、773 BUSY_TIMEOUT（SQLite 3.44+）。只枚举 5/6 会把它们
+    // 当成普通 SQL 错误，调用方按 LockTimeoutError 重试的逻辑就失效了。
+    for (const errcode of [5, 6, 261, 262, 517, 773]) {
+      const error = Object.assign(new Error('database is busy'), { errcode, errstr: 'database is busy' });
+      assert.equal(isLockConflict(error), true, `errcode ${errcode} should be a lock conflict`);
+      assert.throws(() => translateSqliteError(error, 'test'), LockTimeoutError);
+    }
+    // 非锁类错误不受影响
+    assert.equal(isLockConflict(Object.assign(new Error('x'), { errcode: 1, errstr: 'SQL logic error' })), false);
   });
 });
 

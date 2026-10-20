@@ -200,7 +200,7 @@ describe('findMany', () => {
     assert.throws(() => User.findMany(invalid({ nickname: 'x' })), ValidationError);
     // id 是托管列，可以查询，但类型必须匹配（INTEGER）
     assert.throws(() => User.findMany(invalid({ id: 'one' })), ValidationError);
-    assert.throws(() => User.findMany({ name: null }), ValidationError);
+    assert.throws(() => User.findMany(invalid({ name: null })), ValidationError);
     assert.throws(() => User.findMany(invalid({ age: '25' })), ValidationError);
   });
 });
@@ -315,7 +315,7 @@ describe('count', () => {
 
   test('rejects invalid conditions', () => {
     assert.throws(() => User.count(invalid({ nickname: 'x' })), ValidationError);
-    assert.throws(() => User.count({ name: null }), ValidationError);
+    assert.throws(() => User.count(invalid({ name: null })), ValidationError);
   });
 });
 

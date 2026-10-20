@@ -83,18 +83,34 @@ export class Database {
     const { busyTimeout, journalMode } = this.resolveOptions(options);
     this.resolvedBusyTimeout = busyTimeout;
     this.path = path;
-    this.connection = new DatabaseSync(path);
-    try {
-      // SQLite 默认 busy timeout 为 0，多连接并发写同一文件时会立即抛
-      // "database is locked"；设置等待重试窗口后短时锁冲突可自行恢复
-      this.connection.exec(`PRAGMA busy_timeout = ${busyTimeout}`);
-    } catch (error) {
-      // 初始化失败时不能让连接泄漏
-      this.connection.close();
-      translateSqliteError(error, 'Opening the database');
-    }
+    this.connection = this.openConnection(path, busyTimeout);
     if (journalMode !== undefined && path !== MEMORY_PATH) {
       this.applyJournalMode(journalMode);
+    }
+  }
+
+  /**
+   * 打开连接并设置锁等待时长。
+   *
+   * `new DatabaseSync()` 本身也会失败（目录不存在、路径是目录、文件没有读权限），
+   * 这些错误必须和后续语句一样收敛成 `SqlModelError`，而不是把 node:sqlite 的
+   * 裸 `ERR_SQLITE_ERROR` 抛给调用方。失败时关闭半开的连接，避免句柄泄漏。
+   */
+  private openConnection(path: string, busyTimeout: number): DatabaseSync {
+    let connection: DatabaseSync | undefined;
+    try {
+      connection = new DatabaseSync(path);
+      // SQLite 默认 busy timeout 为 0，多连接并发写同一文件时会立即抛
+      // "database is locked"；设置等待重试窗口后短时锁冲突可自行恢复
+      connection.exec(`PRAGMA busy_timeout = ${busyTimeout}`);
+      return connection;
+    } catch (error) {
+      try {
+        connection?.close();
+      } catch {
+        // 连接可能尚未建立，或已不可用
+      }
+      translateSqliteError(error, 'Opening the database');
     }
   }
 
@@ -223,17 +239,20 @@ export class Database {
         'A model with this name is already registered on this database; model names must be unique',
       );
     }
-    const owner = this.tableOwners.get(tableName);
+    // SQLite 的表名大小写不敏感：`users` 与 `Users` 是同一张表，
+    // 按原样比较会放过「两个模型各写一张表」的错觉，实际却在互相 ALTER 同一张表
+    const tableKey = tableName.toLowerCase();
+    const owner = this.tableOwners.get(tableKey);
     if (owner !== undefined) {
       throw new InvalidModelError(
         'This tableName is already used by another model; each model needs its own tableName',
       );
     }
     this.modelNames.add(name);
-    this.tableOwners.set(tableName, name);
+    this.tableOwners.set(tableKey, name);
     return () => {
       this.modelNames.delete(name);
-      this.tableOwners.delete(tableName);
+      this.tableOwners.delete(tableKey);
     };
   }
 
@@ -503,6 +522,9 @@ export class Database {
    */
   reopenAfterReadOnly(): boolean {
     if (this.closed) return false;
+    // 内存库的内容只存在于当前连接里：重开等于换成一个空库，
+    // 「修复只读」会直接丢掉全部数据，宁可让调用方按原错误处理
+    if (this.path === MEMORY_PATH) return false;
     try {
       if (this.inTransaction) return false;
     } catch {

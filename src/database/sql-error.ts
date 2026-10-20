@@ -8,12 +8,17 @@ import {
 } from './errors.js';
 
 /**
- * SQLite 的锁相关 errcode 与 errstr。
+ * SQLite 的锁相关主错误码。
  * SQLITE_BUSY (5)：数据库/表被其他连接占用，等待 busy timeout 后仍未取得锁。
  * SQLITE_LOCKED (6)：同一连接内的共享缓存表锁冲突（例如未重置的语句）。
- * SQLITE_BUSY_SNAPSHOT (517)：WAL 模式下事务快照过期，需重试整个事务。
+ *
+ * 扩展码是 `主码 | (n << 8)`：261 BUSY_RECOVERY、262 LOCKED_SHAREDCACHE、517 BUSY_SNAPSHOT、
+ * 773 BUSY_TIMEOUT（SQLite 3.44+，busy handler 超时后会返回它）等。低字节恒为主码，
+ * 因此按低字节判断，新增的扩展码不需要再补一遍枚举表。
  */
-const LOCK_ERRCODES = new Set([5, 6, 261, 262, 517]);
+const PRIMARY_BUSY = 5;
+const PRIMARY_LOCKED = 6;
+const LOCK_PRIMARY_CODES = new Set([PRIMARY_BUSY, PRIMARY_LOCKED]);
 
 /** node:sqlite 抛出的错误在结构上具备这些字段；此处只做能力探测，不依赖具体类型。 */
 interface SqliteErrorLike {
@@ -34,7 +39,7 @@ function asSqliteErrorLike(error: unknown): SqliteErrorLike | undefined {
 export function isLockConflict(error: unknown): boolean {
   const like = asSqliteErrorLike(error);
   if (like === undefined) return false;
-  if (typeof like.errcode === 'number' && LOCK_ERRCODES.has(like.errcode)) return true;
+  if (typeof like.errcode === 'number' && LOCK_PRIMARY_CODES.has(like.errcode & 0xff)) return true;
   const text = typeof like.errstr === 'string' ? like.errstr : typeof like.message === 'string' ? like.message : '';
   return /database is locked|database table is locked/i.test(text);
 }

@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type { StatementSync } from 'node:sqlite';
 import { DatabaseClosedError, InvalidModelError, TransactionError, ValidationError } from './errors.js';
+import { hideInternalState } from './internal.js';
 import { Model } from './model.js';
 import { isLockConflict, isReadOnlyDatabaseError, translateSqliteError } from './sql-error.js';
 import type { DatabaseOptions, ModelDefinition, ModelFields } from './types.js';
@@ -29,6 +30,45 @@ const READONLY_REOPEN_ATTEMPTS = 5;
 const READONLY_REOPEN_BACKOFF_MS = 5;
 
 const JOURNAL_MODES = new Set(['WAL', 'DELETE', 'MEMORY']);
+
+/**
+ * `Database` 上需要绑定到实例的公开方法。
+ *
+ * 与模型一致：方法定义在原型上并依赖 `this`，一旦被解构（`const { transaction } = db`）
+ * 或作为回调传递就会丢掉 `this`。构造时绑定一次，`db` 与 `User` 的处理方式不同才奇怪。
+ * getter（`isOpen` / `inTransaction` / `busyTimeout`）不在此列：解构 getter 得到的是取值结果。
+ */
+const BOUND_METHODS = [
+  'model',
+  'close',
+  'transaction',
+  'rollback',
+  'isLocked',
+  'setBusyTimeout',
+  'prepare',
+  'exec',
+  'reopenAfterReadOnly',
+] as const;
+
+/** 实例上的内部状态（不可枚举，避免序列化时泄露数据库路径与连接）。 */
+const INTERNAL_FIELDS = [
+  'connection',
+  'path',
+  'models',
+  'modelNames',
+  'tableOwners',
+  'closed',
+  'resolvedBusyTimeout',
+] as const;
+
+/**
+ * 读取 `node:sqlite` 的原生事务状态（`DatabaseSync.isTransaction`，Node 22.16+）。
+ * 属性不存在时返回 undefined，由调用方退回「试探性开启事务」的探测方式。
+ */
+function readNativeTransactionState(connection: DatabaseSync): boolean | undefined {
+  const value = (connection as DatabaseSync & { isTransaction?: unknown }).isTransaction;
+  return typeof value === 'boolean' ? value : undefined;
+}
 
 /**
  * 判断两次 `db.model()` 调用描述的是不是同一个模型。
@@ -86,6 +126,25 @@ export class Database {
     this.connection = this.openConnection(path, busyTimeout);
     if (journalMode !== undefined && path !== MEMORY_PATH) {
       this.applyJournalMode(journalMode);
+    }
+    // 内部状态在运行期仍是可枚举属性，序列化 `db` 会把文件路径写进日志
+    hideInternalState(this, INTERNAL_FIELDS);
+    this.bindPublicMethods();
+  }
+
+  /**
+   * 把公开方法绑定到实例上，使 `const { transaction, model } = db` 这类写法同样可用。
+   * 与模型侧一致：绑定产生的是不可枚举的自有属性，`Object.keys(db)` 的外观不变。
+   */
+  private bindPublicMethods(): void {
+    const prototype = Database.prototype as unknown as Record<string, (this: Database) => unknown>;
+    for (const method of BOUND_METHODS) {
+      Object.defineProperty(this, method, {
+        value: prototype[method]!.bind(this),
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
     }
   }
 
@@ -276,14 +335,23 @@ export class Database {
   /**
    * 当前是否存在未提交的事务（`BEGIN` 之后尚未 `COMMIT` / `ROLLBACK`）。
    *
-   * `node:sqlite` 不支持通过 `PRAGMA autocommit` 读取事务状态（该 pragma 返回空），
-   * 因此改为「尝试再开一个事务」来探测：SQLite 在事务中执行 `BEGIN` 会立即报
-   * "cannot start a transaction within a transaction"。探测到报错就说明已在事务中，
-   * 此时不能再 `COMMIT`（那可能提交别人的事务），只能原样返回 true；
+   * 优先读 `node:sqlite` 的原生状态 `DatabaseSync.isTransaction`（Node 22.16+）：
+   * O(1)，而且能反映调用方自己 `db.exec('BEGIN')` 开启的事务——模型层的每个写操作
+   * 都要问一次这个状态，靠抛异常探测的代价是它的十倍以上。
+   *
+   * 旧版本没有该属性时退回探测：SQLite 在事务中执行 `BEGIN` 会立即报
+   * "cannot start a transaction within a transaction"，据此判断；
    * 探测成功说明之前不在事务中，立即 `ROLLBACK` 撤掉探测开启的空事务。
    */
   get inTransaction(): boolean {
     this.assertOpen();
+    const native = readNativeTransactionState(this.connection);
+    if (native !== undefined) return native;
+    return this.probeTransactionState();
+  }
+
+  /** 兼容路径：靠「再开一个事务」探测状态（`isTransaction` 不可用时使用）。 */
+  private probeTransactionState(): boolean {
     try {
       this.connection.exec('BEGIN');
     } catch (error) {
@@ -498,6 +566,24 @@ export class Database {
         translateSqliteError(retryError, 'Executing a statement');
       }
     }
+  }
+
+  /**
+   * @internal 供模型层使用：预编译语句但不翻译错误。
+   *
+   * 模型层需要在错误信息里带上调用点（`create()` / `search()` …），而 `prepare()` /
+   * `exec()` 是给调用方用的逃生舱，会先把错误翻译成「Preparing a statement failed」。
+   * 一旦在底层翻译掉，`Model.execute` 就再也补不回上下文，因此模型侧走这两个不翻译的入口。
+   */
+  prepareInternal(sql: string): StatementSync {
+    this.assertOpen();
+    return this.connection.prepare(sql);
+  }
+
+  /** @internal 同上，供模型层执行 DDL（`syncFields` / `deleteField`）。 */
+  execInternal(sql: string): void {
+    this.assertOpen();
+    this.connection.exec(sql);
   }
 
   /**

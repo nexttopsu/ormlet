@@ -542,6 +542,16 @@ describe('search 关键字搜索', () => {
     assert.equal(User.search('example.com', { fields: ['name'] }).length, 0);
   });
 
+  test('reports SQL failures under the search() context', () => {
+    // 表被外部删掉后，错误信息里的环节必须是 search() 而不是 findMany()：
+    // 否则调用方照着错误去查 findMany 的代码，永远找不到问题
+    db.exec('DROP TABLE "users"');
+    assert.throws(
+      () => User.search('a'),
+      (error: unknown) => error instanceof Error && error.message.startsWith('search() failed'),
+    );
+  });
+
   test('supports ordering and pagination', () => {
     User.create({ name: 'apple', email: 'a@example.com' });
     User.create({ name: 'banana', email: 'b@example.com' });
@@ -657,6 +667,17 @@ describe('instance handles', () => {
     assert.deepEqual(methodKeys, []);
     assert.equal(Object.prototype.propertyIsEnumerable.call(User, 'create'), false);
     assert.equal(Object.prototype.propertyIsEnumerable.call(User, 'findMany'), false);
+  });
+
+  test('keeps internal state out of Object.keys and JSON.stringify', () => {
+    // TS 的 private 只是编译期；内部状态若可枚举，序列化模型就会把数据库路径写进日志
+    assert.deepEqual(Object.keys(User), ['name', 'tableName']);
+    const serialized = JSON.stringify(User);
+    assert.equal(serialized.includes(':memory:'), false);
+    assert.equal(serialized.includes('database'), false);
+    // 内部状态仍然可用，只是不可枚举
+    assert.equal(User.db, db);
+    assert.equal(User.fields.name, 'TEXT');
   });
 
   test('exposes the underlying connection', () => {

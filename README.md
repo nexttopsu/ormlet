@@ -307,9 +307,10 @@ const total = db.transaction(() => {
 - `db.inTransaction` — 是否存在未提交的事务（`BEGIN` 后尚未结束）。
 - `db.rollback()` — 回滚当前事务，没有事务时返回 `false`。
 
-> `node:sqlite` 不支持通过 `PRAGMA autocommit` 读取事务状态（该 pragma 返回空值），
-> 因此本库用「尝试再开一个事务」来探测：在事务内执行 `BEGIN` 会立即报
-> `cannot start a transaction within a transaction`，据此判定；探测成功则立刻 `ROLLBACK` 撤掉这个空事务。
+> 事务状态优先读 `node:sqlite` 的原生属性 `DatabaseSync.isTransaction`（Node 22.16+ 提供，
+> O(1) 且能反映你自己 `db.exec('BEGIN')` 开启的事务）。更早的版本没有该属性时退回探测：
+> 在事务内执行 `BEGIN` 会立即报 `cannot start a transaction within a transaction`，
+> 据此判定；探测成功则立刻 `ROLLBACK` 撤掉这个空事务。
 
 #### `db.busyTimeout` / `db.setBusyTimeout(ms)` / `db.isLocked()`
 
@@ -412,6 +413,8 @@ const rows = [{ name: '张三' }, { name: '李四' }].map(User.create);
 
 绑定产生的是**不可枚举**的自有属性，`Object.keys(User)` / `JSON.stringify(User)` 的外观与绑定前一致。
 代价是每个模型实例多 19 个闭包，单个 `Database` 上模型数量有限，可以忽略。
+`Database` 的公开方法同样在构造时绑定（`const { transaction, model } = db` 可用），
+内部状态（连接、文件路径、注册表）一律不可枚举，`JSON.stringify(db)` 得到 `{}`。
 
 #### `create(data): ModelRow<F>`
 
@@ -422,8 +425,9 @@ const rows = [{ name: '张三' }, { name: '李四' }].map(User.create);
 - `createdAt` / `updatedAt` 自动写入当前时间，两者取值相同。
 - 空对象（或全部为 `undefined`）抛 `ValidationError`，不会生成无效 SQL。
 - 未知字段、值类型不匹配抛 `ValidationError`。
-- 写入后会回读整行再返回（一次额外的 `SELECT`），所以返回值里的值就是数据库中的实际值，
-  包括 SQLite 可能做的隐式转换（例如 `INTEGER` 列存 `3.0` 读回 `3`）。
+- 写入后会取回整行再返回：用的是 `INSERT ... RETURNING *`，写入与读取在同一条语句里完成，
+  因此返回值就是数据库中的实际值（包括 SQLite 可能做的隐式转换，例如 `INTEGER` 列存 `3.0` 读回 `3`），
+  多进程并发下也不会读到已被其他连接改写的状态。
 
 **性能提示**：每次 `create()` 都是独立事务，默认 `synchronous = FULL` 下每次都要 fsync，
 单条写入在机械盘 / 网络盘上可能慢到几十毫秒（本机 `journalMode: 'DELETE'` 下实测仅 69 ops/s）。
@@ -908,7 +912,7 @@ User.syncFields(); // => []（已同步时）
 - 字段不存在时返回 `false`，删除成功返回 `true`；
 - 字段名同样只接受合法标识符；
 - **该列上若有索引，删除会失败**。本库的错误信息是脱敏的通用文本
-  （`Executing a statement failed: SQLite error 1`），SQLite 的原始原因
+  （`deleteField() failed: SQLite error 1`），SQLite 的原始原因
   `error in index <name> after drop column` 挂在 `error.cause` 上。
   先 `DROP INDEX` 再删列，见[索引章节](#没有索引声明能力时怎么建索引)。
 
@@ -1130,7 +1134,8 @@ try {
 | `database is locked` / `LockTimeoutError` | 另一个连接持有写锁超过 `busyTimeout` | 单进程单实例；缩短事务；必要时调大 `busyTimeout` |
 | `transaction() cannot be nested` | 在事务内又调用 `db.transaction()` | 复用外层事务（模型方法会自动加入） |
 | `The database was closed` | 用了已 `close()` 的实例 | 检查生命周期，模型不可跨重启复用 |
-| `Executing a statement failed: SQLite error 1` | 常见于 `deleteField` 撞索引、SQL 语法错误 | 看 `error.cause.message` |
+| `deleteField() failed: SQLite error 1` | 常见于 `deleteField` 撞索引、SQL 语法错误 | 看 `error.cause.message` |
+| `search() failed` / `create() failed` … | 模型方法的 SQL 在准备或执行阶段失败，前缀是调用点 | 看 `error.cause.message`；`db.exec` / `db.prepare` 仍报 `Executing/Preparing a statement failed` |
 
 ## 安全设计
 
@@ -1214,7 +1219,7 @@ const b = new Database('./data.db');   // 同一文件的第二个连接
 
 **写**
 
-- 逐条 `create()` 是最慢的方式（每次一个事务 + 一次 fsync + 一次回读 `SELECT`）。
+- 逐条 `create()` 是最慢的方式（每次一个事务 + 一次 fsync）。
   批量场景一律用 `createMany()`；需要拿到每行完整数据时，用 `createMany()` 返回的 id 再 `findByIds()` 补读；
 - `journalMode: 'DELETE'` 下逐条写入仅 ~70 ops/s，WAL 下 ~850 ops/s，差一个数量级；
 - 需要多条语句原子执行时用 `db.transaction()`，实测比逐条快 30 倍以上。
@@ -1328,6 +1333,7 @@ const ok = User.update(id, { age: 26 }) !== undefined;
 - 游标分页 `findPage()`、字段投影 `select`、按列计数 `count(_, { column })`；
 - 实例句柄 `User.db`（做 JOIN）与 `User.fields`（反射字段），方法可直接解构（2.1.0 新增）；
 - `db.model()` 幂等：同名同定义重复调用返回同一实例，不再抛 `InvalidModelError`（2.1.0 新增）；
+- `db` 的公开方法也可直接解构：`const { transaction, model } = db`（2.1.2 新增）；
 - 约束错误细分：`UniqueConstraintError` / `NotNullConstraintError` / `ForeignKeyConstraintError`。
 
 ## 开发
@@ -1349,7 +1355,7 @@ npm run stress      # 压力测试：多进程初始化竞态 / 吞吐 / 20 万�
 字段同步与删除、自动时间戳（含旧表迁移）、关闭后拒绝操作、事务（提交 / 回滚 / 嵌套拒绝）、
 条件操作符（范围 / 集合 / 区间 / 判空 / 超长 IN 拆分）、批量写入（分批、原子性、字段集合校验）、
 `deleteMany` 无参拒绝与 `clear()`、upsert（含按主键冲突目标）、字段投影、按列计数、约束错误细分、
-并发首次打开只读恢复、非法参数拒绝、编译期类型检查等 186 个用例，全部可重复运行，不污染任何已有数据库文件。
+并发首次打开只读恢复、非法参数拒绝、编译期类型检查等 207 个用例，全部可重复运行，不污染任何已有数据库文件。
 
 ## 暂未实现（第一版范围外）
 

@@ -289,12 +289,13 @@ export interface CreateManyOptions {
   /**
    * 每行的字段集合不同时是否报错，默认 `true`。
    *
-   * - `true`：所有行必须声明完全相同的字段（可以省略为 `undefined`，视为不写该列）。
+   * - `true`：所有行必须提供完全相同的字段集合（写成 `undefined` 视为**没有提供**）。
    *   一旦出现不一致，各行的缺失字段含义就会在 NULL 与「不写入」之间摇摆，因此直接拒绝；
    * - `false`：缺失字段统一写入 NULL。注意整批共用一条 INSERT，列清单是所有行的并集，
    *   因此缺失的列**不会**触发表定义里的 `DEFAULT`（显式写入 NULL 会覆盖默认值）。
    *
-   * 逐行给出的显式 `null` 与省略的 `undefined` 视为等价（都写入 NULL）。
+   * 显式传 `null` 表示「这一行把该列写成 NULL」，与「不提供该字段」是两回事：
+   * `strictFields: true` 下前者算提供了字段、后者不算，两种写法混用会触发字段集合不一致。
    */
   strictFields?: boolean;
 }

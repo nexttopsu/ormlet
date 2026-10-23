@@ -281,6 +281,51 @@ describe('Database', () => {
     assert.throws(() => User.count(), DatabaseClosedError);
     assert.throws(() => User.search('张三'), DatabaseClosedError);
   });
+
+  test('public methods keep working when destructured', () => {
+    // 与模型侧一致：解构不会丢 this
+    const db = new Database(':memory:');
+    const { model, transaction, exec, prepare, close } = db;
+    const User = model('User', { tableName: 'users', fields: { name: 'TEXT' } });
+    User.create({ name: 'a' });
+    assert.equal(transaction(() => User.count()), 1);
+    assert.deepEqual(exec('PRAGMA user_version = 3'), undefined);
+    assert.equal((prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 3);
+    // 绑定产生的是不可枚举的自有属性
+    assert.equal(Object.prototype.propertyIsEnumerable.call(db, 'transaction'), false);
+    close();
+  });
+
+  test('keeps the connection and file path out of JSON.stringify', () => {
+    // 内部状态（连接、路径、注册表）若可枚举，把 db 丢进日志就会泄露文件路径
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ormlet-json-'));
+    const file = path.join(dir, 'data.db');
+    try {
+      const db = new Database(file);
+      db.model('User', { tableName: 'users', fields: { name: 'TEXT' } });
+      assert.deepEqual(Object.keys(db), []);
+      assert.equal(JSON.stringify(db).includes(file.replace(/\\/g, '\\\\')), false);
+      assert.equal(JSON.stringify(db), '{}');
+      db.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('reads the transaction state from the connection instead of probing', () => {
+    const db = new Database(':memory:');
+    try {
+      assert.equal(db.inTransaction, false);
+      db.exec('BEGIN');
+      assert.equal(db.inTransaction, true);
+      db.exec('COMMIT');
+      assert.equal(db.inTransaction, false);
+      db.transaction(() => assert.equal(db.inTransaction, true));
+      assert.equal(db.inTransaction, false);
+    } finally {
+      db.close();
+    }
+  });
 });
 
 describe('日志模式（WAL）', () => {

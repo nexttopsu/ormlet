@@ -1,6 +1,7 @@
 import type { SQLOutputValue, SQLInputValue } from 'node:sqlite';
 import type { Database } from './database.js';
 import { SqlModelError, TransactionError, ValidationError } from './errors.js';
+import { hideInternalState } from './internal.js';
 import { translateSqliteError, isReadOnlyDatabaseError } from './sql-error.js';
 import type {
   CountOptions,
@@ -94,6 +95,9 @@ const BOUND_METHODS = [
   'deleteField',
 ] as const;
 
+/** 实例上的内部状态（不可枚举，避免序列化时泄露连接与数据库路径）。 */
+const INTERNAL_FIELDS = ['database', 'fieldTypes', 'declaredFields'] as const;
+
 /** 单个字段的一个已解析条件。 */
 interface TupleCondition {
   field: string;
@@ -130,6 +134,9 @@ export class Model<F extends ModelFields = ModelFields> {
     // 浅拷贝后冻结：直接返回调用方传入的对象时，外部改写会让 `fields` 与内部
     // `fieldTypes` 出现两份互相矛盾的声明。
     this.declaredFields = Object.freeze({ ...fields });
+    // TS 的 private 只在编译期生效：运行期这三个字段仍是可枚举自有属性，
+    // `JSON.stringify(User)` 会连数据库文件路径、连接状态一起输出，因此显式隐藏
+    hideInternalState(this, INTERNAL_FIELDS);
 
     // 唯一性占位必须在建表之前：注册失败时不能改动已有表结构。
     // 放在构造函数里，`new Model(...)` 这条绕过 db.model() 的路径也会被拦下。
@@ -140,7 +147,7 @@ export class Model<F extends ModelFields = ModelFields> {
         ...fieldEntries.map(([fieldName, fieldType]) => `"${fieldName}" ${fieldType}`),
       ];
       // STRICT 让 SQLite 在存储层也强制列类型，配合 JS 侧校验形成双重防护
-      database.exec(
+      database.execInternal(
         `CREATE TABLE IF NOT EXISTS "${tableName}" ("${PRIMARY_KEY}" INTEGER PRIMARY KEY AUTOINCREMENT, ${columns.join(', ')}) STRICT`,
       );
       // 表已存在但缺少模型声明的字段时（例如旧版本数据库文件），自动补齐
@@ -206,15 +213,17 @@ export class Model<F extends ModelFields = ModelFields> {
     const sql =
       `INSERT INTO "${this.tableName}" ` +
       `(${entries.map(([field]) => `"${field}"`).join(', ')}) ` +
-      `VALUES (${entries.map(() => '?').join(', ')})`;
-    const result = this.execute('create()', (db) => db.prepare(sql).run(...entryValues(entries)));
-    const id = toSafeInteger(result.lastInsertRowid);
-    // create() 总是插入全部列，回读必为完整行（不使用投影）
-    const row = this.selectById(id) as ModelRow<F> | undefined;
-    if (row === undefined) {
-      throw new SqlModelError(`Inserted row (id = ${id}) could not be read back from the table`);
+      `VALUES (${entries.map(() => '?').join(', ')}) RETURNING *`;
+    // 用 RETURNING 在同一条语句里取回插入的行：
+    // 少一次「插入后按 id 回读」的往返，多进程并发下也不会读到已被别人改写的状态。
+    // 必须用 all() 而不是 get()：get() 只把语句推进一行就返回，隐式事务要等到语句
+    // 走完 / 重置才提交，写锁冲突会被推迟到调用方看不见的地方。
+    const [raw] = this.execute('create()', (db) => db.prepareInternal(sql).all(...entryValues(entries)));
+    if (raw === undefined) {
+      // 只有 BEFORE INSERT 触发器用 RAISE(IGNORE) 跳过整行时才会没有返回行
+      throw new SqlModelError('create() inserted no row: a BEFORE INSERT trigger ignored it');
     }
-    return row;
+    return this.toRow(raw);
   }
 
   /**
@@ -275,7 +284,7 @@ export class Model<F extends ModelFields = ModelFields> {
     }
     return this.execute('findMany()', (db) =>
       db
-        .prepare(sql)
+        .prepareInternal(sql)
         .all(...params)
         .map((raw) => this.toRow(raw)),
     );
@@ -313,7 +322,7 @@ export class Model<F extends ModelFields = ModelFields> {
     let sql = `SELECT ${columns} FROM "${this.tableName}"`;
     if (conditions.length > 0) sql += ` WHERE ${conditions.map((c) => c.sql).join(' AND ')}`;
     sql += ` ORDER BY "${orderBy}" ${order} LIMIT 1`;
-    const raw = this.execute('findOne()', (db) => db.prepare(sql).get(...params));
+    const raw = this.execute('findOne()', (db) => db.prepareInternal(sql).get(...params));
     return raw === undefined ? undefined : this.toRow(raw);
   }
 
@@ -332,7 +341,7 @@ export class Model<F extends ModelFields = ModelFields> {
     let sql = `SELECT 1 AS found FROM "${this.tableName}"`;
     if (conditions.length > 0) sql += ` WHERE ${conditions.map((c) => c.sql).join(' AND ')}`;
     sql += ' LIMIT 1';
-    const raw = this.execute('exists()', (db) => db.prepare(sql).get(...params));
+    const raw = this.execute('exists()', (db) => db.prepareInternal(sql).get(...params));
     return raw !== undefined;
   }
 
@@ -361,7 +370,7 @@ export class Model<F extends ModelFields = ModelFields> {
         `WHERE "${PRIMARY_KEY}" IN (${batch.map(() => '?').join(', ')})`;
       const rows = this.execute('findByIds()', (db) =>
         db
-          .prepare(sql)
+          .prepareInternal(sql)
           .all(...batch)
           .map((raw) => this.toRow(raw)),
       );
@@ -424,7 +433,7 @@ export class Model<F extends ModelFields = ModelFields> {
 
     const rows = this.execute('findPage()', (db) =>
       db
-        .prepare(sql)
+        .prepareInternal(sql)
         .all(...params)
         .map((raw) => this.toRow(raw)),
     );
@@ -479,9 +488,9 @@ export class Model<F extends ModelFields = ModelFields> {
         params.push(offset);
       }
     }
-    return this.execute('findMany()', (db) =>
+    return this.execute('search()', (db) =>
       db
-        .prepare(sql)
+        .prepareInternal(sql)
         .all(...params)
         .map((raw) => this.toRow(raw)),
     );
@@ -509,7 +518,7 @@ export class Model<F extends ModelFields = ModelFields> {
       `WHERE "${PRIMARY_KEY}" = ?`;
     return this.runInTransaction(() => {
       const result = this.execute('update()', (db) =>
-        db.prepare(sql).run(...entryValues(entries), safeId),
+        db.prepareInternal(sql).run(...entryValues(entries), safeId),
       );
       if (toSafeInteger(result.changes) === 0) return undefined;
       return this.selectById(safeId) as ModelRow<F> | undefined;
@@ -533,7 +542,7 @@ export class Model<F extends ModelFields = ModelFields> {
       const row = this.selectById(safeId) as ModelRow<F> | undefined;
       if (row === undefined) return undefined;
       this.execute('delete()', (db) =>
-        db.prepare(`DELETE FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).run(safeId),
+        db.prepareInternal(`DELETE FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).run(safeId),
       );
       return row;
     });
@@ -616,7 +625,7 @@ export class Model<F extends ModelFields = ModelFields> {
         // 用户自建的 BEFORE INSERT 触发器可以用 RAISE(IGNORE) 静默跳过某些行，
         // 此时「同一语句内的 id 连续」并不成立，反推会返回根本不存在的 id（甚至 0）。
         const inserted = this.execute('createMany()', (db) =>
-          db.prepare(`${sql} RETURNING "${PRIMARY_KEY}" AS id`).all(...params),
+          db.prepareInternal(`${sql} RETURNING "${PRIMARY_KEY}" AS id`).all(...params),
         );
         for (const row of inserted) ids.push(toSafeInteger(row.id as number | bigint));
       }
@@ -688,46 +697,34 @@ export class Model<F extends ModelFields = ModelFields> {
     params.push(now, now);
     const columns = [...fields, CREATED_AT, UPDATED_AT].map((field) => `"${field}"`).join(', ');
     const placeholders = fields.map(() => '?').join(', ');
-    return this.execute('upsert()', (db) => {
-      if (assignable.length === 0) {
-        // DO NOTHING 不返回行：先尝试插入并探测是否真的插入了
-        const inserted = db
-          .prepare(
-            `INSERT INTO "${this.tableName}" (${columns}) VALUES (${placeholders}, ?, ?) ` +
-              `${conflict}DO NOTHING RETURNING "${PRIMARY_KEY}" AS id`,
-          )
-          .get(...params);
-        if (inserted !== undefined) {
-          const row = this.selectById(toSafeInteger(inserted.id as number | bigint)) as ModelRow<F> | undefined;
-          if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
-          return row;
+    const insertSql = `INSERT INTO "${this.tableName}" (${columns}) VALUES (${placeholders}, ?, ?) `;
+    const selectByTargetSql =
+      `SELECT * FROM "${this.tableName}" ` +
+      `WHERE ${target.map((field) => `"${field}" = ?`).join(' AND ')} LIMIT 1`;
+    // 整个 upsert 在一个事务里：DO NOTHING 分支要「先插入、再定位冲突行」两步，
+    // 事务保证这两步之间不会被并发写入插进来（与 update / delete 的处理一致）
+    return this.runInTransaction(() =>
+      this.execute('upsert()', (db) => {
+        if (assignable.length === 0) {
+          // DO NOTHING 不返回行（冲突时）；RETURNING * 直接给出真正插入的那一行。
+          // all() 而非 get()：get() 不会把语句执行完，隐式事务的提交与写锁冲突都会延后
+          const [inserted] = db.prepareInternal(`${insertSql}${conflict}DO NOTHING RETURNING *`).all(...params);
+          if (inserted !== undefined) return this.toRow(inserted);
+          const existing = db
+            .prepareInternal(selectByTargetSql)
+            .get(...target.map((field) => (byField.get(field) ?? null) as SQLInputValue));
+          if (existing === undefined) {
+            throw new SqlModelError('The conflicting row could not be located after upsert');
+          }
+          return this.toRow(existing);
         }
-        const existing = db
-          .prepare(
-            `SELECT "${PRIMARY_KEY}" AS id FROM "${this.tableName}" ` +
-              `WHERE ${target.map((field) => `"${field}" = ?`).join(' AND ')} LIMIT 1`,
-          )
-          .get(...target.map((field) => (byField.get(field) ?? null) as SQLInputValue));
-        if (existing === undefined) {
-          throw new SqlModelError('The conflicting row could not be located after upsert');
+        const [row] = db.prepareInternal(`${insertSql}${conflict}${updateSql} RETURNING *`).all(...params);
+        if (row === undefined) {
+          throw new SqlModelError('The upserted row could not be read back from the table');
         }
-        const row = this.selectById(toSafeInteger(existing.id as number | bigint)) as ModelRow<F> | undefined;
-        if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
-        return row;
-      }
-      const updated = db
-        .prepare(
-          `INSERT INTO "${this.tableName}" (${columns}) VALUES (${placeholders}, ?, ?) ` +
-            `${conflict}${updateSql} RETURNING "${PRIMARY_KEY}" AS id`,
-        )
-        .get(...params);
-      if (updated === undefined) {
-        throw new SqlModelError('The upserted row could not be read back from the table');
-      }
-      const row = this.selectById(toSafeInteger(updated.id as number | bigint)) as ModelRow<F> | undefined;
-      if (row === undefined) throw new SqlModelError('The upserted row could not be read back from the table');
-      return row;
-    });
+        return this.toRow(row);
+      }),
+    );
   }
 
   /**
@@ -792,7 +789,7 @@ export class Model<F extends ModelFields = ModelFields> {
           `VALUES (${fields.map(() => '?').join(', ')}, ?, ?) ` +
           `ON CONFLICT (${target.map((field) => `"${field}"`).join(', ')}) ` +
           (assignable.length === 0 ? 'DO NOTHING' : `DO UPDATE SET ${assignments.join(', ')}`);
-        const result = this.execute('upsertMany()', (db) => db.prepare(sql).run(...params));
+        const result = this.execute('upsertMany()', (db) => db.prepareInternal(sql).run(...params));
         changes += toSafeInteger(result.changes);
       }
     });
@@ -823,7 +820,7 @@ export class Model<F extends ModelFields = ModelFields> {
       // 只取主键，避免把整行（含 BLOB）读进内存；主键只增不减，按 id 分批不会漏行
       const ids = this.execute('updateMany()', (db) =>
         db
-          .prepare(`SELECT "${PRIMARY_KEY}" AS id FROM "${this.tableName}" WHERE ${whereSql} ORDER BY "${PRIMARY_KEY}"`)
+          .prepareInternal(`SELECT "${PRIMARY_KEY}" AS id FROM "${this.tableName}" WHERE ${whereSql} ORDER BY "${PRIMARY_KEY}"`)
           .all(...whereParams)
           .map((row) => toSafeInteger(row.id as number | bigint)),
       );
@@ -833,7 +830,7 @@ export class Model<F extends ModelFields = ModelFields> {
           `UPDATE "${this.tableName}" SET ${setSql}, "${UPDATED_AT}" = ? ` +
           `WHERE "${PRIMARY_KEY}" IN (${batch.map(() => '?').join(', ')})`;
         const result = this.execute('updateMany()', (db) =>
-          db.prepare(sql).run(...setParams, now, ...batch),
+          db.prepareInternal(sql).run(...setParams, now, ...batch),
         );
         changes += toSafeInteger(result.changes);
         statements += 1;
@@ -891,14 +888,14 @@ export class Model<F extends ModelFields = ModelFields> {
     this.runInTransaction(() => {
       const ids = this.execute('deleteMany()', (db) =>
         db
-          .prepare(`SELECT "${PRIMARY_KEY}" AS id FROM "${this.tableName}" WHERE ${whereSql} ORDER BY "${PRIMARY_KEY}"`)
+          .prepareInternal(`SELECT "${PRIMARY_KEY}" AS id FROM "${this.tableName}" WHERE ${whereSql} ORDER BY "${PRIMARY_KEY}"`)
           .all(...whereParams)
           .map((row) => toSafeInteger(row.id as number | bigint)),
       );
       for (let start = 0; start < ids.length; start += chunkSize) {
         const batch = ids.slice(start, start + chunkSize);
         const sql = `DELETE FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" IN (${batch.map(() => '?').join(', ')})`;
-        const result = this.execute('deleteMany()', (db) => db.prepare(sql).run(...batch));
+        const result = this.execute('deleteMany()', (db) => db.prepareInternal(sql).run(...batch));
         changes += toSafeInteger(result.changes);
         statements += 1;
       }
@@ -932,7 +929,7 @@ export class Model<F extends ModelFields = ModelFields> {
     if (clauses.length > 0) {
       sql += ` WHERE ${clauses.join(' AND ')}`;
     }
-    const raw = this.execute('count()', (db) => db.prepare(sql).get(...params));
+    const raw = this.execute('count()', (db) => db.prepareInternal(sql).get(...params));
     const total = raw?.total;
     if (typeof total !== 'number' && typeof total !== 'bigint') {
       throw new SqlModelError('COUNT() did not return an integer');
@@ -955,7 +952,7 @@ export class Model<F extends ModelFields = ModelFields> {
     for (const [field, type] of this.fieldTypes) {
       if (columns.has(field.toLowerCase())) continue;
       this.execute('syncFields()', (db) =>
-        db.exec(`ALTER TABLE "${this.tableName}" ADD COLUMN "${field}" ${type}`),
+        db.execInternal(`ALTER TABLE "${this.tableName}" ADD COLUMN "${field}" ${type}`),
       );
       added.push(field);
     }
@@ -963,7 +960,7 @@ export class Model<F extends ModelFields = ModelFields> {
     for (const [field, type] of MANAGED_COLUMNS) {
       if (columns.has(field.toLowerCase())) continue;
       this.execute('syncFields()', (db) =>
-        db.exec(`ALTER TABLE "${this.tableName}" ADD COLUMN "${field}" ${type}`),
+        db.execInternal(`ALTER TABLE "${this.tableName}" ADD COLUMN "${field}" ${type}`),
       );
       added.push(field);
     }
@@ -994,14 +991,14 @@ export class Model<F extends ModelFields = ModelFields> {
       return false;
     }
     this.execute('deleteField()', (db) =>
-      db.exec(`ALTER TABLE "${this.tableName}" DROP COLUMN "${field}"`),
+      db.execInternal(`ALTER TABLE "${this.tableName}" DROP COLUMN "${field}"`),
     );
     return true;
   }
 
   private selectById(id: number, columns = '*'): ModelRow<F> | Record<string, SQLOutputValue> | undefined {
     const raw = this.execute('findById()', (db) =>
-      db.prepare(`SELECT ${columns} FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).get(id),
+      db.prepareInternal(`SELECT ${columns} FROM "${this.tableName}" WHERE "${PRIMARY_KEY}" = ?`).get(id),
     );
     return raw === undefined ? undefined : this.toRow(raw);
   }
@@ -1010,7 +1007,7 @@ export class Model<F extends ModelFields = ModelFields> {
   private getTableColumns(): string[] {
     return this.execute('Reading table columns', (db) =>
       db
-        .prepare('SELECT name FROM pragma_table_info(?)')
+        .prepareInternal('SELECT name FROM pragma_table_info(?)')
         .all(this.tableName)
         .map((row) => String(row.name)),
     );

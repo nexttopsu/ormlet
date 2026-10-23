@@ -1,5 +1,6 @@
 import {
   CheckConstraintError,
+  ConstraintError,
   ForeignKeyConstraintError,
   LockTimeoutError,
   NotNullConstraintError,
@@ -65,13 +66,23 @@ export function isReadOnlyDatabaseError(error: unknown): boolean {
 }
 
 /**
+ * 约束错误类共用的构造签名：各子类都继承 `ConstraintError` 的构造函数，
+ * 因此可以统一用同一份映射表，而不是借某一个子类的类型。
+ */
+type ConstraintErrorConstructor = new (
+  message: string,
+  errcode?: number,
+  options?: { cause?: unknown },
+) => ConstraintError;
+
+/**
  * SQLITE_CONSTRAINT 扩展 errcode → 具体错误类型。
  *
  * SQLite 的扩展码是 `19 | (n << 8)`，不同约束互相独立，因此**必须**按完整 errcode 精确匹配，
  * 不能用 `& 0xff` 归并——那样会把主键冲突、外键冲突混为一种。
  * 这些值取自 sqlite3.h，跨版本稳定。
  */
-const CONSTRAINT_ERRORS: Readonly<Record<number, typeof UniqueConstraintError>> = {
+const CONSTRAINT_ERRORS: Readonly<Record<number, ConstraintErrorConstructor>> = {
   275: CheckConstraintError, // SQLITE_CONSTRAINT_CHECK
   787: ForeignKeyConstraintError, // SQLITE_CONSTRAINT_FOREIGNKEY
   1299: NotNullConstraintError, // SQLITE_CONSTRAINT_NOTNULL
@@ -80,7 +91,7 @@ const CONSTRAINT_ERRORS: Readonly<Record<number, typeof UniqueConstraintError>> 
 };
 
 /** 从错误文本里识别约束类型，用于 errcode 缺失或为裸 19 时的兜底。 */
-function constraintFromMessage(text: string): typeof UniqueConstraintError | undefined {
+function constraintFromMessage(text: string): ConstraintErrorConstructor | undefined {
   if (/UNIQUE constraint failed/i.test(text)) return UniqueConstraintError;
   if (/NOT NULL constraint failed/i.test(text)) return NotNullConstraintError;
   if (/FOREIGN KEY constraint failed/i.test(text)) return ForeignKeyConstraintError;
@@ -131,7 +142,7 @@ export function translateSqliteError(error: unknown, context: string): never {
 }
 
 /** 约束错误的一句人话说明；不包含 SQL 原文，只说明违反了哪类约束。 */
-function describeConstraint(Constraint: typeof UniqueConstraintError): string {
+function describeConstraint(Constraint: ConstraintErrorConstructor): string {
   if (Constraint === UniqueConstraintError) {
     return 'a row with the same primary key or unique value already exists';
   }
